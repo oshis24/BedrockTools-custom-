@@ -306,7 +306,7 @@ bool ZoomModule::onTouchEvent(const pl::input::TouchEvent& ev) {
                 m_isFirstTime = true;
                 m_animationFinished = false;
                 m_targetZoomFov = m_defaultZoomFov;
-                return true; // KONSUMSI EVENT
+                return true; // KONSUMSI EVENT DOWN
             }
             break;
 
@@ -315,9 +315,9 @@ bool ZoomModule::onTouchEvent(const pl::input::TouchEvent& ev) {
                 float deltaY = ev.y - m_lastTouchY;
                 m_lastTouchY = ev.y;
                 updateDrag(deltaY);
-                return true;
             }
-            break;
+            // RETURN FALSE: Izinkan Minecraft memproses pergerakan jari lain (analog & kamera)
+            return false;
 
         case kActionUp:
         case kActionPointerUp:
@@ -352,7 +352,7 @@ void ZoomModule::loadConfig(const nlohmann::json& j) {
     if (j.contains("m_lowSens"))         m_lowSens         = j["m_lowSens"].get<bool>();
     if (j.contains("m_lowSensStrength")) m_lowSensStrength = j["m_lowSensStrength"].get<float>();
     if (j.contains("m_hideHand"))        m_hideHand        = j["m_hideHand"].get<bool>();
-    if (j.contains("m_overlayToggle"))   m_overlayToggle   = j["m_overlayToggle"].get<bool>();
+    if (j.contains("m_overlayToggle"))   m_overlayToggle   = j["m_overlayToggle"].get<float>();
     if (j.contains("m_posX"))            m_posX            = j["m_posX"].get<float>();
     if (j.contains("m_posY"))            m_posY            = j["m_posY"].get<float>();
     if (j.contains("m_scale"))           m_scale           = j["m_scale"].get<float>();
