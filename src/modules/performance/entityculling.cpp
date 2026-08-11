@@ -723,30 +723,3 @@ void EntityCullingModule::saveConfig(
     j["entitiesVisiblePercent"] =
         entitiesVisiblePercent;
 }
----REG---
-ModuleRegistry& ModuleRegistry::get() {
-    static ModuleRegistry registry;
-    return registry;
-}
-
-ModuleRegistry.cpp include missing in tail? It had performance include already. So we need tell user only three changes. But code itself still potentially has semantic mismatch: Invisible should probably preserve not skip. Reference said invisible entities maybe skip culling, not cull them. Our current code skips them from candidate, meaning they disappear! Must fix: if invisible, result should preserve actor. Also wall culling should perhaps only if blocked, but if blockSource null preserve. Our code if cull target and no blockSource still candidate, okay.
-
-Most dangerous: returning filtered list from ActorManagerList may have huge semantic implications. But reference does it. Fine.
-
-Potential recursion? Hook ActorManagerList and our code calls original. Fine.
-
-Need no use `std::unordered_set` now. Need code complete. Also view angle reference perhaps parameter +0x48 not necessarily 180 default. Fine.
-
-Could perhaps use linear search O(n²) after sort; okay first build, but performance mod itself adds overhead. Better use unordered_set survivors, but code simple. Yet entity culling should be efficient. We can use unordered_set. But include unordered_set. The current code's linear search can be bad. Let's make survivors set for O(n). But memory overhead. Fine.
-
-Need maybe install hook on init if enabled; Module config load happens before initialize? uncertain but okay.
-
-Need mention do NOT change Signatures.cpp. No new signatures because existing ones. Need mention xmake no change.
-
-Need writing block because complete code artifact. Maybe two writing blocks? user asks code complete, multiple files. Use document blocks? Could put 3 files in one document writing block with headings and code? Writing blocks should be finished reusable text, but code is excluded. So code blocks outside writing block. Developer says no writing block for code. Good.
-
-Need explain current source has already been modified but user should not use that archive? They want GitHub. We can say ignore previous generated archive. Need maybe exact registry diff. Could give full ModuleRegistry.cpp? User asks code complete, perhaps only lines to add. But "kirim kode lengkap nya kesini nnti saya tempel ke github". Could mean complete entityculling files. We'll give complete 2 files and exact registry additions, not full 200-line registry. Also perhaps manifest no need.
-
-Need cite source lines. We can mention xmake auto includes cpp and existing signatures. Also `ClientInstance::current`, levelRenderer, localPlayer. We have source lines for localPlayer truncated but enough. Could cite. Need no URL.
-
-Let's final in Indonesian.
