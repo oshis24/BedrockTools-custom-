@@ -35,6 +35,7 @@
 #include "player/skinstealer.hpp"
 #include "player/autogg.hpp"
 #include "player/autoreq.hpp"
+#include "performance/entityculling.hpp"
 
 ModuleRegistry& ModuleRegistry::get() {
     static ModuleRegistry registry;
