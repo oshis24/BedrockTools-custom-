@@ -6,23 +6,29 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
-#include <cstdint>
-#include <cstring>
 #include <dlfcn.h>
-#include <string>
+#include <mutex>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
-#include <vector>
-#include <time.h>
+
 
 namespace {
+
+using GlUniform4fvFn =
+    void (*)(GLint, GLsizei, const GLfloat*);
 
 using GlUseProgramFn =
     void (*)(GLuint);
 
-using GlUniform4fvFn =
-    void (*)(GLint, GLsizei, const GLfloat*);
+using GlEnableFn =
+    void (*)(GLenum);
+
+using GlDisableFn =
+    void (*)(GLenum);
 
 using GlGetProgramivFn =
     void (*)(GLuint, GLenum, GLint*);
@@ -44,77 +50,107 @@ using GlGetUniformLocationFn =
 
 OutlineRGBModule* g_module = nullptr;
 
-GlUseProgramFn g_useProgramOriginal = nullptr;
-GlUniform4fvFn g_uniform4fvOriginal = nullptr;
 
+/*
+ * Original functions.
+ */
+GlUniform4fvFn g_uniform4fvOriginal = nullptr;
+GlUseProgramFn g_useProgramOriginal = nullptr;
+GlEnableFn g_enableOriginal = nullptr;
+GlDisableFn g_disableOriginal = nullptr;
+
+
+/*
+ * GL helper functions. They are not hooked; they are only
+ * resolved from the same GLES library.
+ */
 GlGetProgramivFn g_getProgramiv = nullptr;
 GlGetActiveUniformFn g_getActiveUniform = nullptr;
 GlGetUniformLocationFn g_getUniformLocation = nullptr;
 
-bedrocktools::hooks::Handle g_useProgramHook = nullptr;
-bedrocktools::hooks::Handle g_uniform4fvHook = nullptr;
 
-bool g_initialized = false;
+/*
+ * Hook handles.
+ */
+bedrocktools::hooks::Handle
+    g_uniform4fvHook = nullptr;
+
+bedrocktools::hooks::Handle
+    g_useProgramHook = nullptr;
+
+bedrocktools::hooks::Handle
+    g_enableHook = nullptr;
+
+bedrocktools::hooks::Handle
+    g_disableHook = nullptr;
 
 
 /*
- * We keep a small cache because glUseProgram is called often,
- * while shader programs are comparatively few.
+ * Initialization state.
+ */
+std::atomic_bool g_workerStarted = false;
+std::atomic_bool g_hooksInstalled = false;
+
+
+/*
+ * RE reference tracks the current GL program.
+ *
+ * GL calls are made from the rendering thread, so a
+ * thread-local value is safer for our implementation.
+ */
+thread_local GLuint g_currentProgram = 0;
+
+
+/*
+ * RE reference tracks GL_DEPTH_TEST through glEnable/
+ * glDisable.
+ */
+thread_local bool g_depthTestEnabled = false;
+
+
+/*
+ * Cached information for each shader program.
  */
 struct ProgramInfo {
     bool inspected = false;
-    bool likelyEntityShader = false;
 
-    std::vector<GLint> colorLocations;
+    GLint outlineLocation = -1;
 };
 
-std::unordered_map<GLuint, ProgramInfo>
-    g_programs;
+
+std::mutex g_programMutex;
+
+std::unordered_map<
+    GLuint,
+    ProgramInfo
+> g_programs;
 
 
 /*
- * Current GL program is thread-local because all GL calls
- * relevant here are made on the rendering thread.
+ * Exact shader uniform names found in the reference RE.
+ *
+ * These are the important correction over our previous
+ * heuristic "Bones/Color/MatColor" implementation.
  */
-thread_local GLuint
-    g_currentProgram = 0;
+constexpr std::string_view
+    kOutlineUniformA =
+        "FogAndDistanceColor";
 
-
-/*
- * Read monotonic time.
- */
-double monotonicSeconds() {
-    timespec ts{};
-
-    if (clock_gettime(
-            CLOCK_MONOTONIC,
-            &ts
-        ) != 0) {
-        return 0.0;
-    }
-
-    return static_cast<double>(ts.tv_sec) +
-           static_cast<double>(ts.tv_nsec) *
-               1.0e-9;
-}
+constexpr std::string_view
+    kOutlineUniformB =
+        "RenderChunkAlpha";
 
 
 /*
  * HSV → RGB.
- *
- * h: [0, 1)
- * s: [0, 1]
- * v: [0, 1]
  */
 std::array<float, 3> hsvToRgb(
-    float h,
-    float s,
-    float v
+    float hue
 ) {
-    h = h - std::floor(h);
+    hue -= std::floor(hue);
 
     const float scaled =
-        h * 6.0f;
+        hue * 6.0f;
 
     const int sector =
         static_cast<int>(
@@ -126,47 +162,73 @@ std::array<float, 3> hsvToRgb(
         static_cast<float>(sector);
 
     const float p =
-        v * (1.0f - s);
+        0.0f;
 
     const float q =
-        v * (
-            1.0f -
-            s * fraction
-        );
+        1.0f -
+        fraction;
 
     const float t =
-        v * (
-            1.0f -
-            s * (1.0f - fraction)
-        );
+        fraction;
 
     switch (sector % 6) {
         case 0:
-            return {v, t, p};
+            return {1.0f, t, p};
 
         case 1:
-            return {q, v, p};
+            return {q, 1.0f, p};
 
         case 2:
-            return {p, v, t};
+            return {p, 1.0f, t};
 
         case 3:
-            return {p, q, v};
+            return {p, q, 1.0f};
 
         case 4:
-            return {t, p, v};
+            return {t, p, 1.0f};
 
         default:
-            return {v, p, q};
+            return {1.0f, p, q};
     }
 }
 
 
 /*
- * Current outline colour.
+ * RE reference uses:
  *
- * The cycle is intentionally slow enough to remain visible
- * while keeping the calculation effectively free.
+ *     clock_gettime(CLOCK_MONOTONIC)
+ *     seconds * 0.5
+ *     * 6
+ *     fmod(..., 6)
+ *
+ * which gives a complete 6-phase RGB cycle in roughly
+ * two seconds.
+ */
+double monotonicSeconds() {
+    timespec ts{};
+
+    if (
+        clock_gettime(
+            CLOCK_MONOTONIC,
+            &ts
+        ) != 0
+    ) {
+        return 0.0;
+    }
+
+    return
+        static_cast<double>(
+            ts.tv_sec
+        ) +
+        static_cast<double>(
+            ts.tv_nsec
+        ) * 1.0e-9;
+}
+
+
+/*
+ * Generates the exact style of RGB transition used in
+ * the reference module.
  */
 std::array<float, 4> getOutlineColor() {
 
@@ -180,8 +242,18 @@ std::array<float, 4> getOutlineColor() {
     }
 
 
-    if (!g_module->rgbCycle) {
+    const float alpha =
+        std::clamp(
+            g_module->alpha,
+            0.0f,
+            1.0f
+        );
 
+
+    /*
+     * Static/custom colour mode.
+     */
+    if (!g_module->rgbCycle) {
         return {
             std::clamp(
                 g_module->red,
@@ -201,79 +273,68 @@ std::array<float, 4> getOutlineColor() {
                 1.0f
             ),
 
-            std::clamp(
-                g_module->alpha,
-                0.0f,
-                1.0f
-            )
+            alpha
         };
     }
 
 
     /*
-     * Approximately one complete RGB cycle every 4 seconds.
+     * 2-second RGB cycle.
      */
-    const float hue =
+    const float phase =
         static_cast<float>(
             std::fmod(
-                monotonicSeconds() * 0.25,
-                1.0
+                monotonicSeconds() * 0.5 * 6.0,
+                6.0
             )
         );
 
+    const float hue =
+        phase / 6.0f;
 
     const auto rgb =
-        hsvToRgb(
-            hue,
-            0.90f,
-            1.0f
-        );
+        hsvToRgb(hue);
 
 
     return {
         rgb[0],
         rgb[1],
         rgb[2],
-        std::clamp(
-            g_module->alpha,
-            0.0f,
-            1.0f
-        )
+        alpha
     };
 }
 
 
 /*
- * Determine whether a GLSL uniform name should be treated
- * as a candidate model colour.
+ * Test whether the current uniform name is one of the
+ * two exact reference outline uniforms.
  */
-bool isColorUniform(
+bool isOutlineUniform(
     std::string_view name
 ) {
     return
-        name == "Color" ||
-        name == "MatColor";
+        name == kOutlineUniformA ||
+        name == kOutlineUniformB;
 }
 
 
 /*
- * Determine whether a program looks like a Bedrock
- * entity/model shader.
+ * Scan one GL program for the exact outline uniform.
  *
- * The old mod inspected uniforms such as Color,
- * MatColor, FogAndDistanceColor and Bones.
- *
- * We use those properties instead of hard-coding
- * program IDs, which are version dependent.
+ * The reference scans GL_ACTIVE_UNIFORMS and stores the
+ * location for later glUniform4fv calls.
  */
 ProgramInfo inspectProgram(
     GLuint program
 ) {
     ProgramInfo info{};
 
-    if (!g_getProgramiv ||
+    if (
+        !g_getProgramiv ||
         !g_getActiveUniform ||
-        !g_getUniformLocation) {
+        !g_getUniformLocation
+    ) {
+        info.inspected = true;
         return info;
     }
 
@@ -287,26 +348,23 @@ ProgramInfo inspectProgram(
     );
 
 
-    if (uniformCount <= 0 ||
-        uniformCount > 512) {
-
+    if (
+        uniformCount <= 0 ||
+        uniformCount > 512
+    ) {
         info.inspected = true;
         return info;
     }
 
 
-    bool hasBones = false;
-    bool hasFogDistance = false;
-    bool hasMatColor = false;
-    bool hasColor = false;
-
-
     std::array<char, 256> nameBuffer{};
 
 
-    for (GLint index = 0;
-         index < uniformCount;
-         ++index) {
+    for (
+        GLint index = 0;
+        index < uniformCount;
+        ++index
+    ) {
 
         GLsizei length = 0;
         GLint size = 0;
@@ -332,76 +390,36 @@ ProgramInfo inspectProgram(
 
         const std::string_view name(
             nameBuffer.data(),
-            static_cast<std::size_t>(length)
+            static_cast<std::size_t>(
+                length
+            )
         );
 
 
         if (
-            name == "Bones" ||
-            name.rfind(
-                "Bones[",
-                0
-            ) == 0
+            !isOutlineUniform(name)
         ) {
-            hasBones = true;
+            continue;
         }
 
 
-        if (
-            name ==
-            "FogAndDistanceColor"
-        ) {
-            hasFogDistance = true;
-        }
+        const GLint location =
+            g_getUniformLocation(
+                program,
+                nameBuffer.data()
+            );
 
 
-        if (name == "MatColor")
-            hasMatColor = true;
+        if (location >= 0) {
+            info.outlineLocation =
+                location;
 
-
-        if (name == "Color")
-            hasColor = true;
-
-
-        if (isColorUniform(name)) {
-
-            const GLint location =
-                g_getUniformLocation(
-                    program,
-                    nameBuffer.data()
-                );
-
-            if (location >= 0) {
-                info.colorLocations.push_back(
-                    location
-                );
-            }
+            /*
+             * One of the two target uniforms is sufficient.
+             */
+            break;
         }
     }
-
-
-    /*
-     * Conservative classification.
-     *
-     * We don't alter arbitrary GUI/particle shaders.
-     */
-    info.likelyEntityShader =
-        (
-            hasBones &&
-            (hasColor || hasMatColor)
-        ) ||
-        (
-            hasFogDistance &&
-            hasColor
-        );
-
-
-    /*
-     * If this program doesn't look like a model shader,
-     * discard candidate color locations.
-     */
-    if (!info.likelyEntityShader)
-        info.colorLocations.clear();
 
 
     info.inspected = true;
@@ -411,49 +429,110 @@ ProgramInfo inspectProgram(
 
 
 /*
+ * Retrieve cached program info, inspecting only once.
+ */
+ProgramInfo getProgramInfo(
+    GLuint program
+) {
+    {
+        std::lock_guard lock(
+            g_programMutex
+        );
+
+        const auto it =
+            g_programs.find(program);
+
+        if (
+            it != g_programs.end()
+        ) {
+            return it->second;
+        }
+    }
+
+
+    const ProgramInfo info =
+        inspectProgram(program);
+
+
+    {
+        std::lock_guard lock(
+            g_programMutex
+        );
+
+        if (g_programs.size() < 256) {
+            g_programs.emplace(
+                program,
+                info
+            );
+        }
+    }
+
+
+    return info;
+}
+
+
+/*
  * glUseProgram detour.
+ *
+ * Reference behaviour:
+ *
+ *     save current program
+ *     call original
  */
 void useProgramHook(
     GLuint program
 ) {
-    if (g_useProgramOriginal) {
+    g_currentProgram =
+        program;
 
+    if (g_useProgramOriginal) {
         g_useProgramOriginal(
             program
         );
     }
+}
 
 
-    g_currentProgram =
-        program;
-
-
-    if (!g_module ||
-        !g_module->enabled) {
-        return;
+/*
+ * glEnable detour.
+ *
+ * Reference specifically tracks GL_DEPTH_TEST (0xB71).
+ */
+void enableHook(
+    GLenum capability
+) {
+    if (
+        capability ==
+        GL_DEPTH_TEST
+    ) {
+        g_depthTestEnabled = true;
     }
 
-
-    auto it =
-        g_programs.find(program);
-
-
-    if (it != g_programs.end())
-        return;
-
-
-    /*
-     * Program inspection happens only once per program.
-     */
-    auto info =
-        inspectProgram(program);
+    if (g_enableOriginal) {
+        g_enableOriginal(
+            capability
+        );
+    }
+}
 
 
-    if (g_programs.size() < 256) {
+/*
+ * glDisable detour.
+ */
+void disableHook(
+    GLenum capability
+) {
+    if (
+        capability ==
+        GL_DEPTH_TEST
+    ) {
+        g_depthTestEnabled = false;
+    }
 
-        g_programs.emplace(
-            program,
-            std::move(info)
+    if (g_disableOriginal) {
+        g_disableOriginal(
+            capability
         );
     }
 }
@@ -461,21 +540,48 @@ void useProgramHook(
 
 /*
  * glUniform4fv detour.
+ *
+ * Exact reference conditions reconstructed from RE:
+ *
+ *   1. outline enabled
+ *   2. current program has a cached target location
+ *   3. location == target location
+ *   4. GL_DEPTH_TEST is enabled
+ *   5. incoming RGB is below ~0.2
+ *   6. incoming alpha is above ~0.5
+ *
+ * Then the outgoing vec4 is replaced with the configured
+ * or RGB-cycled outline colour.
  */
 void uniform4fvHook(
     GLint location,
     GLsizei count,
     const GLfloat* value
 ) {
-    if (!g_uniform4fvOriginal)
-        return;
-
-
-    if (!g_module ||
-        !g_module->enabled ||
+    if (
+        !g_uniform4fvOriginal ||
         !value ||
-        count <= 0) {
+        count <= 0
+    ) {
+        if (g_uniform4fvOriginal) {
+            g_uniform4fvOriginal(
+                location,
+                count,
+                value
+            );
+        }
 
+        return;
+    }
+
+
+    /*
+     * Disabled = exact pass-through.
+     */
+    if (
+        !g_module ||
+        !g_module->enabled
+    ) {
         g_uniform4fvOriginal(
             location,
             count,
@@ -486,18 +592,50 @@ void uniform4fvHook(
     }
 
 
-    auto it =
-        g_programs.find(
+    /*
+     * Outline master switch.
+     */
+    if (
+        !g_module->masterEnabled ||
+        !g_module->keybindActive
+    ) {
+        g_uniform4fvOriginal(
+            location,
+            count,
+            value
+        );
+
+        return;
+    }
+
+
+    /*
+     * Reference tracks depth-test state because the
+     * outline pass is distinguished from other uniform
+     * updates by this GL state.
+     */
+    if (!g_depthTestEnabled) {
+        g_uniform4fvOriginal(
+            location,
+            count,
+            value
+        );
+
+        return;
+    }
+
+
+    const ProgramInfo info =
+        getProgramInfo(
             g_currentProgram
         );
 
 
     if (
-        it ==
-        g_programs.end() ||
-        !it->second.likelyEntityShader
+        info.outlineLocation < 0 ||
+        location !=
+            info.outlineLocation
     ) {
-
         g_uniform4fvOriginal(
             location,
             count,
@@ -508,20 +646,24 @@ void uniform4fvHook(
     }
 
 
-    bool isCandidate = false;
-
-    for (const GLint candidate :
-         it->second.colorLocations) {
-
-        if (candidate == location) {
-            isCandidate = true;
-            break;
-        }
-    }
+    /*
+     * The reference checks the first vec4 only.
+     */
+    const float r = value[0];
+    const float g = value[1];
+    const float b = value[2];
+    const float a = value[3];
 
 
-    if (!isCandidate) {
+    constexpr float kRgbThreshold =
+        0.2f;
 
+    if (
+        r >= kRgbThreshold ||
+        g >= kRgbThreshold ||
+        b >= kRgbThreshold ||
+        a <= 0.5f
+    ) {
         g_uniform4fvOriginal(
             location,
             count,
@@ -537,9 +679,10 @@ void uniform4fvHook(
 
 
     /*
-     * We only modify the first vec4. If the caller is
-     * uploading an array, preserve the remainder by using
-     * a temporary copy.
+     * Preserve array elements when count > 1.
+     *
+     * The normal Bedrock path is a single vec4, but we
+     * avoid corrupting an array uniform.
      */
     if (count == 1) {
 
@@ -553,14 +696,12 @@ void uniform4fvHook(
     }
 
 
-    /*
-     * Array uniform case.
-     */
     std::vector<GLfloat> modified(
         value,
         value +
-            static_cast<std::size_t>(count) *
-            4u
+            static_cast<std::size_t>(
+                count
+            ) * 4u
     );
 
 
@@ -578,121 +719,314 @@ void uniform4fvHook(
 }
 
 
-void installHooks() {
+/*
+ * Wait for libGLESv2.so.
+ *
+ * The reference waits roughly 500 ms between attempts and
+ * makes a finite number of attempts.
+ */
+void glHookWorker() {
+    constexpr int kAttempts = 19;
 
-    if (g_initialized)
-        return;
-
-
-    auto gles =
-        bedrocktools::hooks::openLibrary(
-            "libGLESv2.so"
-        );
-
-
-    if (!gles)
-        return;
+    constexpr auto kDelay =
+        std::chrono::milliseconds(500);
 
 
-    const auto useProgram =
-        bedrocktools::hooks::symbol(
-            gles,
-            "glUseProgram"
-        );
-
-
-    const auto uniform4fv =
-        bedrocktools::hooks::symbol(
-            gles,
-            "glUniform4fv"
-        );
-
-
-    g_getProgramiv =
-        reinterpret_cast<
-            GlGetProgramivFn
-        >(
-            bedrocktools::hooks::symbol(
-                gles,
-                "glGetProgramiv"
+    for (
+        int attempt = 0;
+        attempt < kAttempts;
+        ++attempt
+    ) {
+        if (
+            g_hooksInstalled.load(
+                std::memory_order_acquire
             )
+        ) {
+            return;
+        }
+
+
+        void* gles =
+            dlopen(
+                "libGLESv2.so",
+                RTLD_NOW | RTLD_NOLOAD
+            );
+
+
+        if (gles) {
+
+            const auto useProgram =
+                reinterpret_cast<
+                    void*
+                >(
+                    dlsym(
+                        gles,
+                        "glUseProgram"
+                    )
+                );
+
+
+            const auto uniform4fv =
+                reinterpret_cast<
+                    void*
+                >(
+                    dlsym(
+                        gles,
+                        "glUniform4fv"
+                    )
+                );
+
+
+            const auto enable =
+                reinterpret_cast<
+                    void*
+                >(
+                    dlsym(
+                        gles,
+                        "glEnable"
+                    )
+                );
+
+
+            const auto disable =
+                reinterpret_cast<
+                    void*
+                >(
+                    dlsym(
+                        gles,
+                        "glDisable"
+                    )
+                );
+
+
+            g_getProgramiv =
+                reinterpret_cast<
+                    GlGetProgramivFn
+                >(
+                    dlsym(
+                        gles,
+                        "glGetProgramiv"
+                    )
+                );
+
+
+            g_getActiveUniform =
+                reinterpret_cast<
+                    GlGetActiveUniformFn
+                >(
+                    dlsym(
+                        gles,
+                        "glGetActiveUniform"
+                    )
+                );
+
+
+            g_getUniformLocation =
+                reinterpret_cast<
+                    GlGetUniformLocationFn
+                >(
+                    dlsym(
+                        gles,
+                        "glGetUniformLocation"
+                    )
+                );
+
+
+            if (
+                useProgram &&
+                uniform4fv &&
+                enable &&
+                disable &&
+                g_getProgramiv &&
+                g_getActiveUniform &&
+                g_getUniformLocation
+            ) {
+
+                auto useProgramHandle =
+                    bedrocktools::hooks::install(
+                        useProgram,
+                        reinterpret_cast<void*>(
+                            useProgramHook
+                        ),
+                        reinterpret_cast<void**>(
+                            &g_useProgramOriginal
+                        )
+                    );
+
+
+                if (!useProgramHandle) {
+                    dlclose(gles);
+                    std::this_thread::sleep_for(
+                        kDelay
+                    );
+                    continue;
+                }
+
+
+                auto uniformHandle =
+                    bedrocktools::hooks::install(
+                        uniform4fv,
+                        reinterpret_cast<void*>(
+                            uniform4fvHook
+                        ),
+                        reinterpret_cast<void**>(
+                            &g_uniform4fvOriginal
+                        )
+                    );
+
+
+                if (!uniformHandle) {
+                    bedrocktools::hooks::remove(
+                        useProgramHandle
+                    );
+
+                    g_useProgramOriginal =
+                        nullptr;
+
+                    dlclose(gles);
+
+                    std::this_thread::sleep_for(
+                        kDelay
+                    );
+
+                    continue;
+                }
+
+
+                auto enableHandle =
+                    bedrocktools::hooks::install(
+                        enable,
+                        reinterpret_cast<void*>(
+                            enableHook
+                        ),
+                        reinterpret_cast<void**>(
+                            &g_enableOriginal
+                        )
+                    );
+
+
+                if (!enableHandle) {
+                    bedrocktools::hooks::remove(
+                        uniformHandle
+                    );
+
+                    bedrocktools::hooks::remove(
+                        useProgramHandle
+                    );
+
+                    g_uniform4fvOriginal =
+                        nullptr;
+
+                    g_useProgramOriginal =
+                        nullptr;
+
+                    dlclose(gles);
+
+                    std::this_thread::sleep_for(
+                        kDelay
+                    );
+
+                    continue;
+                }
+
+
+                auto disableHandle =
+                    bedrocktools::hooks::install(
+                        disable,
+                        reinterpret_cast<void*>(
+                            disableHook
+                        ),
+                        reinterpret_cast<void**>(
+                            &g_disableOriginal
+                        )
+                    );
+
+
+                if (!disableHandle) {
+                    bedrocktools::hooks::remove(
+                        enableHandle
+                    );
+
+                    bedrocktools::hooks::remove(
+                        uniformHandle
+                    );
+
+                    bedrocktools::hooks::remove(
+                        useProgramHandle
+                    );
+
+                    g_enableOriginal =
+                        nullptr;
+
+                    g_uniform4fvOriginal =
+                        nullptr;
+
+                    g_useProgramOriginal =
+                        nullptr;
+
+                    dlclose(gles);
+
+                    std::this_thread::sleep_for(
+                        kDelay
+                    );
+
+                    continue;
+                }
+
+
+                g_useProgramHook =
+                    useProgramHandle;
+
+                g_uniform4fvHook =
+                    uniformHandle;
+
+                g_enableHook =
+                    enableHandle;
+
+                g_disableHook =
+                    disableHandle;
+
+
+                g_hooksInstalled.store(
+                    true,
+                    std::memory_order_release
+                );
+
+
+                dlclose(gles);
+
+                return;
+            }
+
+
+            dlclose(gles);
+        }
+
+
+        std::this_thread::sleep_for(
+            kDelay
         );
+    }
+}
 
 
-    g_getActiveUniform =
-        reinterpret_cast<
-            GlGetActiveUniformFn
-        >(
-            bedrocktools::hooks::symbol(
-                gles,
-                "glGetActiveUniform"
-            )
-        );
+void startWorker() {
+    bool expected = false;
 
-
-    g_getUniformLocation =
-        reinterpret_cast<
-            GlGetUniformLocationFn
-        >(
-            bedrocktools::hooks::symbol(
-                gles,
-                "glGetUniformLocation"
-            )
-        );
-
-
-    if (!useProgram ||
-        !uniform4fv ||
-        !g_getProgramiv ||
-        !g_getActiveUniform ||
-        !g_getUniformLocation) {
-
-        bedrocktools::hooks::closeLibrary(
-            gles
-        );
-
+    if (
+        !g_workerStarted.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_acq_rel
+        )
+    ) {
         return;
     }
 
 
-    g_useProgramHook =
-        bedrocktools::hooks::install(
-            reinterpret_cast<void*>(
-                useProgram
-            ),
-            reinterpret_cast<void*>(
-                useProgramHook
-            ),
-            reinterpret_cast<void**>(
-                &g_useProgramOriginal
-            )
-        );
-
-
-    g_uniform4fvHook =
-        bedrocktools::hooks::install(
-            reinterpret_cast<void*>(
-                uniform4fv
-            ),
-            reinterpret_cast<void*>(
-                uniform4fvHook
-            ),
-            reinterpret_cast<void**>(
-                &g_uniform4fvOriginal
-            )
-        );
-
-
-    bedrocktools::hooks::closeLibrary(
-        gles
-    );
-
-
-    g_initialized =
-        g_useProgramHook != nullptr &&
-        g_uniform4fvHook != nullptr &&
-        g_useProgramOriginal != nullptr &&
-        g_uniform4fvOriginal != nullptr;
+    std::thread(
+        glHookWorker
+    ).detach();
 }
 
 } // namespace
@@ -701,17 +1035,16 @@ void installHooks() {
 OutlineRGBModule::OutlineRGBModule()
     : Module(
         "Outline RGB",
-        "Applies an animated RGB colour to compatible entity model shaders."
+        "Changes the Bedrock block-outline colour and optionally cycles RGB."
     ) {
     g_module = this;
 }
 
 
 OutlineRGBModule::~OutlineRGBModule() {
-
     /*
-     * Like the asset hook, leave the GL hooks installed
-     * and make the detours transparent when disabled.
+     * The hook remains installed for the runtime lifetime;
+     * when disabled it simply forwards to the original GL calls.
      */
     if (g_module == this)
         g_module = nullptr;
@@ -719,7 +1052,12 @@ OutlineRGBModule::~OutlineRGBModule() {
 
 
 void OutlineRGBModule::onInit() {
-    installHooks();
+    /*
+     * IMPORTANT:
+     *
+     * Do not block ModuleRegistry::initialize().
+     */
+    startWorker();
 }
 
 
