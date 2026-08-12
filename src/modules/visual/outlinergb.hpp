@@ -4,8 +4,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cstdint>
-
 class OutlineRGBModule final : public Module {
 public:
     OutlineRGBModule();
@@ -18,13 +16,10 @@ public:
     void loadConfig(const nlohmann::json& j) override;
     void saveConfig(nlohmann::json& j) override;
 
-    bool rgbCycle = true;
+    bool rgbCycle = false;
 
     float red = 1.0f;
     float green = 0.15f;
     float blue = 0.95f;
     float alpha = 1.0f;
-
-private:
-    void installHooks();
 };
