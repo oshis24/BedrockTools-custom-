@@ -28,7 +28,6 @@ public:
 
 private:
     void* m_actorManagerListTarget = nullptr;
-    bedrocktools::hooks::Handle m_actorManagerListHook = nullptr;
 
     void installHooks();
     void removeHooks();
