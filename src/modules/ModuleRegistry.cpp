@@ -111,8 +111,9 @@ void registerAllModules() {
     registry.emplace<AutoGG>();
     registry.emplace<AutoReQ>();
     registry.emplace<FPSUnlockerModule>();
+    registry.emplace<EntityCullingModule>();
     registry.emplace<LightOverlayModule>();
     registry.emplace<ShulkerPreviewModule>();
     registry.emplace<ConnectedGlassModule>();
-    registry.emplace<EntityCullingModule>();
+    
 }
