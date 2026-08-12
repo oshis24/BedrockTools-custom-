@@ -13,10 +13,15 @@ public:
     void onEnable() override;
     void onDisable() override;
 
-    void loadConfig(const nlohmann::json& j) override;
-    void saveConfig(nlohmann::json& j) override;
+    void loadConfig(
+        const nlohmann::json& j
+    ) override;
 
-    bool rgbCycle = false;
+    void saveConfig(
+        nlohmann::json& j
+    ) override;
+
+    bool rgbCycle = true;
 
     float red = 1.0f;
     float green = 0.15f;
