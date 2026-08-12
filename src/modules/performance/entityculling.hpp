@@ -16,25 +16,19 @@ public:
     void loadConfig(const nlohmann::json& j) override;
     void saveConfig(nlohmann::json& j) override;
 
-    // Entity Culling configuration.
     bool cullPlayers = true;
     bool cullEntities = true;
     bool wallCulling = true;
 
-    // Maximum horizontal view angle used by the reference
-    // culling algorithm.
-    float viewAngle = 180.0f;
+    float viewAngle = 120.0f;
+    float cullDistance = 64.0f;
 
-    // Maximum entity distance.
-    float cullDistance = 128.0f;
-
-    // Percentage of nearest candidates retained after sorting.
     int playersVisiblePercent = 100;
-    int entitiesVisiblePercent = 100;
+    int entitiesVisiblePercent = 50;
 
 private:
     void* m_actorManagerListTarget = nullptr;
-    void* m_actorManagerListHook = nullptr;
+    bedrocktools::hooks::Handle m_actorManagerListHook = nullptr;
 
     void installHooks();
     void removeHooks();
