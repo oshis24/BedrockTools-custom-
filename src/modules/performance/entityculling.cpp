@@ -13,27 +13,39 @@
 
 namespace {
 
-using ActorManagerListFn = std::vector<void*> (*)(void*);
-using ActorIsPlayerFn = bool (*)(void*);
-using ActorIsInvisibleFn = bool (*)(void*);
+using ActorManagerListFn =
+    std::vector<void*> (*)(void*);
+
+using ActorIsPlayerFn =
+    bool (*)(void*);
+
+using ActorIsInvisibleFn =
+    bool (*)(void*);
+
 using BlockSourceIsSolidBlockingBlockFn =
     bool (*)(void*, const bedrocktools::sdk::BlockPos*);
+
 
 struct Candidate {
     void* actor = nullptr;
     float distanceSq = 0.0f;
 };
 
-EntityCullingModule* g_entityCulling = nullptr;
+
+EntityCullingModule* g_module = nullptr;
 
 ActorManagerListFn g_actorManagerListOriginal = nullptr;
+
 ActorIsPlayerFn g_actorIsPlayer = nullptr;
+
 ActorIsInvisibleFn g_actorIsInvisible = nullptr;
-BlockSourceIsSolidBlockingBlockFn g_isSolidBlockingBlock = nullptr;
+
+BlockSourceIsSolidBlockingBlockFn
+    g_isSolidBlockingBlock = nullptr;
 
 
 /*
- * Normalize an angle to [-180, 180].
+ * Convert an angle into [-180, 180].
  */
 float normalizeDegrees(float angle) {
     angle = std::fmod(angle, 360.0f);
@@ -49,94 +61,126 @@ float normalizeDegrees(float angle) {
 
 
 /*
- * Reference Entity Culling uses atan2-based horizontal
- * direction comparison rather than a full frustum-plane test.
+ * Horizontal FOV test.
+ *
+ * BedrockTools reference uses an atan2-based horizontal
+ * direction test rather than a complete frustum test.
  */
-bool withinViewAngle(
+bool insideViewAngle(
     float dx,
     float dz,
-    float cameraYaw,
-    float viewAngle
+    float yaw,
+    float angle
 ) {
-    if (viewAngle >= 360.0f)
+    if (angle >= 360.0f)
         return true;
 
-    if (viewAngle <= 0.0f)
+    if (angle <= 0.0f)
         return false;
 
-    constexpr float RadToDeg =
+    constexpr float RAD_TO_DEG =
         57.29577951308232f;
 
     const float direction =
-        std::atan2(dz, dx) * RadToDeg;
+        std::atan2(dz, dx) * RAD_TO_DEG;
 
     /*
-     * The reference implementation applies a 90 degree
-     * coordinate-system offset before normalization.
+     * Minecraft's yaw coordinate system requires the
+     * 90 degree adjustment used by the reference.
      */
     const float relative =
         normalizeDegrees(
-            direction - (cameraYaw + 90.0f)
+            direction - (yaw + 90.0f)
         );
 
     return std::fabs(relative) <=
-           (viewAngle * 0.5f);
+           angle * 0.5f;
 }
 
 
 /*
- * Test whether the line from camera to an entity passes
- * through a solid-blocking block.
+ * Wall visibility test.
  *
- * The reference implementation increases the number of
- * samples with distance and clamps it to [2, 256].
+ * The reference implementation scales sample count
+ * with distance:
+ *
+ *     distance * 2
+ *
+ * clamped to [2, 256].
  */
-bool lineHitsSolidBlock(
+bool blockedByWall(
     bedrocktools::sdk::BlockSource* blockSource,
-    const bedrocktools::sdk::Vec3& start,
-    const bedrocktools::sdk::Vec3& end
+    const bedrocktools::sdk::Vec3& camera,
+    const bedrocktools::sdk::Vec3& target
 ) {
-    if (!blockSource || !g_isSolidBlockingBlock)
+    if (!blockSource ||
+        !g_isSolidBlockingBlock) {
         return false;
+    }
 
-    const float dx = end.x - start.x;
-    const float dy = end.y - start.y;
-    const float dz = end.z - start.z;
+    const float dx =
+        target.x - camera.x;
+
+    const float dy =
+        target.y - camera.y;
+
+    const float dz =
+        target.z - camera.z;
+
+    const float distanceSq =
+        dx * dx +
+        dy * dy +
+        dz * dz;
 
     const float distance =
-        std::sqrt(
-            dx * dx +
-            dy * dy +
-            dz * dz
-        );
+        std::sqrt(distanceSq);
 
     int sampleCount =
-        static_cast<int>(distance * 2.0f);
+        static_cast<int>(
+            distance * 2.0f
+        );
 
     sampleCount =
-        std::clamp(sampleCount, 2, 256);
+        std::clamp(
+            sampleCount,
+            2,
+            256
+        );
 
     const float step =
-        1.0f / static_cast<float>(sampleCount);
+        1.0f /
+        static_cast<float>(sampleCount);
 
     /*
-     * Do not test the camera endpoint or entity endpoint.
-     * Those points are not wall samples in the reference
-     * implementation.
+     * Skip both endpoints.
+     *
+     * i = 1 ... sampleCount - 1
      */
-    for (int i = 1; i < sampleCount; ++i) {
+    for (int i = 1;
+         i < sampleCount;
+         ++i) {
+
         const float t =
-            static_cast<float>(i) * step;
+            static_cast<float>(i) *
+            step;
 
         bedrocktools::sdk::BlockPos blockPos{
             static_cast<int>(
-                std::floor(start.x + dx * t)
+                std::floor(
+                    camera.x + dx * t
+                )
             ),
+
             static_cast<int>(
-                std::floor(start.y + dy * t)
+                std::floor(
+                    camera.y + dy * t
+                )
             ),
+
             static_cast<int>(
-                std::floor(start.z + dz * t)
+                std::floor(
+                    camera.z + dz * t
+                )
             )
         };
 
@@ -155,28 +199,86 @@ bool lineHitsSolidBlock(
 /*
  * Keep only the requested percentage of candidates.
  *
- * Candidates are sorted by distance first, so this keeps
- * the nearest candidates.
+ * Candidates are ordered nearest -> farthest.
+ *
+ * We use nth_element when possible so that a 25%-50%
+ * configuration does not require a complete sort of
+ * every candidate.
  */
 void trimCandidates(
     std::vector<Candidate>& candidates,
     int percent
 ) {
     percent =
-        std::clamp(percent, 0, 100);
+        std::clamp(
+            percent,
+            0,
+            100
+        );
+
+    if (candidates.empty())
+        return;
+
+    if (percent >= 100)
+        return;
+
+    if (percent <= 0) {
+        candidates.clear();
+        return;
+    }
 
     const std::size_t count =
         candidates.size();
 
     const std::size_t keep =
-        (
-            count *
-            static_cast<std::size_t>(percent) +
-            99u
-        ) / 100u;
+        std::max<std::size_t>(
+            1,
+            (
+                count *
+                static_cast<std::size_t>(percent) +
+                99u
+            ) / 100u
+        );
 
-    if (keep < count)
-        candidates.resize(keep);
+    if (keep >= count)
+        return;
+
+    /*
+     * Find the boundary element first.
+     *
+     * This is cheaper than sorting all candidates when
+     * only a small percentage is retained.
+     */
+    auto middle =
+        candidates.begin() +
+        static_cast<std::ptrdiff_t>(keep);
+
+    std::nth_element(
+        candidates.begin(),
+        middle,
+        candidates.end(),
+        [](const Candidate& a,
+           const Candidate& b) {
+            return a.distanceSq <
+                   b.distanceSq;
+        }
+    );
+
+    candidates.resize(keep);
+
+    /*
+     * Only sort the candidates that will actually
+     * survive.
+     */
+    std::sort(
+        candidates.begin(),
+        candidates.end(),
+        [](const Candidate& a,
+           const Candidate& b) {
+            return a.distanceSq <
+                   b.distanceSq;
+        }
+    );
 }
 
 
@@ -190,27 +292,30 @@ std::vector<void*> entityCullingHook(
         return {};
 
     /*
-     * Always obtain the original list first.
+     * Always obtain the original Actor list.
      */
-    auto actors =
-        g_actorManagerListOriginal(actorManager);
+    const std::vector<void*> actors =
+        g_actorManagerListOriginal(
+            actorManager
+        );
 
     /*
-     * If the module is disabled, behave exactly like
-     * the original function.
+     * If disabled, return the original result without
+     * doing any additional work.
      */
-    if (!g_entityCulling ||
-        !g_entityCulling->enabled) {
+    if (!g_module ||
+        !g_module->enabled) {
         return actors;
     }
 
     if (actors.empty())
         return actors;
 
-    if (!g_entityCulling->cullPlayers &&
-        !g_entityCulling->cullEntities) {
+    if (!g_module->cullPlayers &&
+        !g_module->cullEntities) {
         return actors;
     }
+
 
     /*
      * Obtain the current ClientInstance.
@@ -221,6 +326,7 @@ std::vector<void*> entityCullingHook(
     if (!client)
         return actors;
 
+
     /*
      * Obtain the local player.
      */
@@ -230,130 +336,171 @@ std::vector<void*> entityCullingHook(
     if (!localPlayer)
         return actors;
 
+
     /*
-     * Entity Culling uses the renderer's camera position.
+     * The reference culling implementation obtains the
+     * camera position/rotation from the player.
+     *
+     * Using the SDK Actor directly also avoids the extra
+     * renderer/player-renderer chain used in v1.
      */
-    auto* renderer =
-        client->levelRenderer();
-
-    if (!renderer)
-        return actors;
-
-    auto* rendererPlayer =
-        renderer->playerRenderer();
-
-    if (!rendererPlayer)
-        return actors;
-
     const bedrocktools::sdk::Vec3 camera =
-        rendererPlayer->cameraPosition();
+        localPlayer->position();
 
-    /*
-     * Local player's yaw.
-     */
     const bedrocktools::sdk::Vec2 rotation =
         localPlayer->rotation();
 
     const float cameraYaw =
         rotation.y;
 
+
     /*
-     * Distance limit.
+     * Maximum distance.
      */
-    const float distance =
+    const float maxDistance =
         std::max(
             0.0f,
-            g_entityCulling->cullDistance
+            g_module->cullDistance
         );
 
     const float maxDistanceSq =
-        distance * distance;
+        maxDistance *
+        maxDistance;
+
 
     /*
-     * World block source used for wall culling.
+     * Block source for wall culling.
      */
-    auto* dimension =
-        localPlayer->dimension();
+    bedrocktools::sdk::BlockSource*
+        blockSource = nullptr;
 
-    auto* blockSource =
-        dimension
-            ? dimension->blockSource()
-            : nullptr;
+    if (auto* dimension =
+            localPlayer->dimension()) {
+
+        blockSource =
+            dimension->blockSource();
+    }
+
+
+    /*
+     * IMPORTANT:
+     *
+     * result contains actors which are guaranteed to
+     * survive without going through the candidate list.
+     *
+     * candidates contains actors that are subject to
+     * culling.
+     */
+    std::vector<void*> result;
 
     std::vector<Candidate> players;
     std::vector<Candidate> entities;
 
-    players.reserve(actors.size());
-    entities.reserve(actors.size());
+
+    /*
+     * We intentionally do NOT reserve actors.size().
+     *
+     * The reference implementation grows its vectors
+     * only when candidates actually survive the initial
+     * filtering.
+     */
+    result.reserve(
+        actors.size()
+    );
 
 
     /*
-     * Iterate through every Actor returned by Minecraft.
+     * SINGLE PASS through ActorManagerList.
      */
     for (void* actor : actors) {
+
         if (!actor)
             continue;
+
 
         /*
          * Never cull the local player.
          */
-        if (actor == localPlayer)
+        if (actor == localPlayer) {
+            result.push_back(actor);
             continue;
+        }
+
 
         /*
-         * Determine player/entity category.
+         * Determine whether this Actor is a player.
          */
         const bool isPlayer =
             g_actorIsPlayer
                 ? g_actorIsPlayer(actor)
                 : false;
 
+
+        /*
+         * Determine whether this category is enabled.
+         */
         const bool shouldCull =
             isPlayer
-                ? g_entityCulling->cullPlayers
-                : g_entityCulling->cullEntities;
+                ? g_module->cullPlayers
+                : g_module->cullEntities;
+
 
         /*
-         * If this category is disabled, we don't add the
-         * Actor to the culling candidate list.
-         *
-         * It will be preserved below when rebuilding the
-         * final list.
+         * If this category is disabled, preserve the
+         * Actor immediately.
          */
-        if (!shouldCull)
+        if (!shouldCull) {
+            result.push_back(actor);
             continue;
+        }
+
 
         /*
-         * Minecraft already considers this Actor invisible.
-         * Don't attempt additional visibility calculations.
+         * Already-invisible Actors are NOT removed.
+         *
+         * They are simply excluded from our additional
+         * culling logic.
          */
         if (g_actorIsInvisible &&
             g_actorIsInvisible(actor)) {
+
+            result.push_back(actor);
             continue;
         }
+
 
         auto* nativeActor =
             reinterpret_cast<
                 bedrocktools::sdk::Actor*
             >(actor);
 
+
         /*
-         * Get the Actor AABB.
+         * Actor bounding-box center.
          */
         const bedrocktools::sdk::AABB bounds =
             nativeActor->bounds();
 
-        /*
-         * Entity center.
-         */
         const bedrocktools::sdk::Vec3 center{
-            (bounds.min.x + bounds.max.x) * 0.5f,
-            (bounds.min.y + bounds.max.y) * 0.5f,
-            (bounds.min.z + bounds.max.z) * 0.5f
+            (
+                bounds.min.x +
+                bounds.max.x
+            ) * 0.5f,
+
+            (
+                bounds.min.y +
+                bounds.max.y
+            ) * 0.5f,
+
+            (
+                bounds.min.z +
+                bounds.max.z
+            ) * 0.5f
         };
 
+
         /*
-         * Camera -> entity vector.
+         * Camera -> Actor vector.
          */
         const float dx =
             center.x - camera.x;
@@ -364,6 +511,7 @@ std::vector<void*> entityCullingHook(
         const float dz =
             center.z - camera.z;
 
+
         /*
          * Distance squared.
          */
@@ -372,154 +520,109 @@ std::vector<void*> entityCullingHook(
             dy * dy +
             dz * dz;
 
+
         /*
          * Distance culling.
          */
         if (distanceSq >
             maxDistanceSq) {
+
             continue;
         }
 
+
         /*
-         * Horizontal angle/FOV culling.
+         * Horizontal FOV culling.
          */
-        if (!withinViewAngle(
+        if (!insideViewAngle(
                 dx,
                 dz,
                 cameraYaw,
-                g_entityCulling->viewAngle
+                g_module->viewAngle
             )) {
+
             continue;
         }
+
 
         /*
          * Optional wall culling.
          */
-        if (g_entityCulling->wallCulling &&
+        if (g_module->wallCulling &&
             blockSource &&
             g_isSolidBlockingBlock) {
 
-            if (lineHitsSolidBlock(
+            if (blockedByWall(
                     blockSource,
                     camera,
                     center
                 )) {
+
                 continue;
             }
         }
 
+
         /*
-         * Candidate survived all visibility tests.
+         * Actor survived visibility tests.
          */
         Candidate candidate{
             actor,
             distanceSq
         };
 
-        if (isPlayer)
-            players.push_back(candidate);
-        else
-            entities.push_back(candidate);
+
+        if (isPlayer) {
+            players.push_back(
+                candidate
+            );
+        } else {
+            entities.push_back(
+                candidate
+            );
+        }
     }
 
 
     /*
-     * Sort nearest → farthest.
-     */
-    const auto byDistance =
-        [](const Candidate& a,
-           const Candidate& b) {
-            return a.distanceSq <
-                   b.distanceSq;
-        };
-
-    std::sort(
-        players.begin(),
-        players.end(),
-        byDistance
-    );
-
-    std::sort(
-        entities.begin(),
-        entities.end(),
-        byDistance
-    );
-
-
-    /*
-     * Keep the requested percentage.
+     * Apply percentage limits.
+     *
+     * Both lists are sorted nearest-first.
      */
     trimCandidates(
         players,
-        g_entityCulling->playersVisiblePercent
+        g_module->playersVisiblePercent
     );
 
     trimCandidates(
         entities,
-        g_entityCulling->entitiesVisiblePercent
+        g_module->entitiesVisiblePercent
     );
 
 
     /*
-     * Mark survivors.
+     * Append surviving candidates.
      *
-     * Actors for which culling was disabled are preserved.
-     * The local player is also preserved.
+     * No second scan of the original Actor list.
      */
-    std::vector<void*> result;
-    result.reserve(actors.size());
+    for (const Candidate& candidate :
+         players) {
 
-    for (void* actor : actors) {
-        if (!actor)
-            continue;
-
-        if (actor == localPlayer) {
-            result.push_back(actor);
-            continue;
-        }
-
-        const bool isPlayer =
-            g_actorIsPlayer
-                ? g_actorIsPlayer(actor)
-                : false;
-
-        const bool shouldCull =
-            isPlayer
-                ? g_entityCulling->cullPlayers
-                : g_entityCulling->cullEntities;
-
-        /*
-         * Category isn't being culled.
-         */
-        if (!shouldCull) {
-            result.push_back(actor);
-            continue;
-        }
-
-        /*
-         * Search candidate lists for the Actor.
-         *
-         * This is intentionally simple for the first test
-         * build. We can optimize this after functionality
-         * is confirmed.
-         */
-        bool keep = false;
-
-        const auto& list =
-            isPlayer
-                ? players
-                : entities;
-
-        for (const auto& candidate : list) {
-            if (candidate.actor == actor) {
-                keep = true;
-                break;
-            }
-        }
-
-        if (keep)
-            result.push_back(actor);
+        if (candidate.actor)
+            result.push_back(
+                candidate.actor
+            );
     }
+
+    for (const Candidate& candidate :
+         entities) {
+
+        if (candidate.actor)
+            result.push_back(
+                candidate.actor
+            );
+    }
+
 
     return result;
 }
@@ -530,13 +633,11 @@ std::vector<void*> entityCullingHook(
 EntityCullingModule::EntityCullingModule()
     : Module(
         "Entity Culling",
-        "Cull distant, off-angle, and wall-occluded entities for better performance."
+        "Cull distant, off-angle, and occluded entities."
     ) {
-    g_entityCulling = this;
 
-    /*
-     * This module has no HUD editor component.
-     */
+    g_module = this;
+
     hideInHudEditor = true;
 }
 
@@ -544,41 +645,51 @@ EntityCullingModule::EntityCullingModule()
 EntityCullingModule::~EntityCullingModule() {
     removeHooks();
 
-    if (g_entityCulling == this)
-        g_entityCulling = nullptr;
+    if (g_module == this)
+        g_module = nullptr;
 }
 
 
 void EntityCullingModule::onInit() {
+
     /*
-     * Resolve ActorManagerList.
+     * ActorManagerList.
      */
     m_actorManagerListTarget =
         reinterpret_cast<void*>(
             bedrocktools::memory::resolve(
-                bedrocktools::memory::SignatureId::ActorManagerList
+                bedrocktools::memory::SignatureId::
+                    ActorManagerList
             )
         );
 
+
     /*
-     * Resolve Actor helpers.
+     * ActorIsPlayer.
      */
     g_actorIsPlayer =
         reinterpret_cast<ActorIsPlayerFn>(
             bedrocktools::memory::resolve(
-                bedrocktools::memory::SignatureId::ActorIsPlayer
+                bedrocktools::memory::SignatureId::
+                    ActorIsPlayer
             )
         );
 
+
+    /*
+     * ActorIsInvisible.
+     */
     g_actorIsInvisible =
         reinterpret_cast<ActorIsInvisibleFn>(
             bedrocktools::memory::resolve(
-                bedrocktools::memory::SignatureId::ActorIsInvisible
+                bedrocktools::memory::SignatureId::
+                    ActorIsInvisible
             )
         );
 
+
     /*
-     * Resolve block visibility helper.
+     * BlockSourceIsSolidBlockingBlock.
      */
     g_isSolidBlockingBlock =
         reinterpret_cast<
@@ -590,16 +701,20 @@ void EntityCullingModule::onInit() {
             )
         );
 
+
     /*
-     * If the module was enabled from config before
-     * initialization, install the hook now.
+     * Do not install the hook here.
+     *
+     * Module::loadConfig() may enable the module before
+     * initialization depending on startup order.
+     *
+     * onEnable() is the single hook installation point.
      */
-    if (enabled)
-        installHooks();
 }
 
 
 void EntityCullingModule::installHooks() {
+
     if (m_actorManagerListHook)
         return;
 
@@ -607,28 +722,25 @@ void EntityCullingModule::installHooks() {
         return;
 
     m_actorManagerListHook =
-        reinterpret_cast<void*>(
-            bedrocktools::hooks::install(
-                m_actorManagerListTarget,
-                reinterpret_cast<void*>(
-                    entityCullingHook
-                ),
-                reinterpret_cast<void**>(
-                    &g_actorManagerListOriginal
-                )
+        bedrocktools::hooks::install(
+            m_actorManagerListTarget,
+            reinterpret_cast<void*>(
+                entityCullingHook
+            ),
+            reinterpret_cast<void**>(
+                &g_actorManagerListOriginal
             )
         );
 }
 
 
 void EntityCullingModule::removeHooks() {
+
     if (!m_actorManagerListHook)
         return;
 
     bedrocktools::hooks::remove(
-        reinterpret_cast<
-            bedrocktools::hooks::Handle
-        >(m_actorManagerListHook)
+        m_actorManagerListHook
     );
 
     m_actorManagerListHook = nullptr;
