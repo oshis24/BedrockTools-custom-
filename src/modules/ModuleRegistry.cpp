@@ -36,6 +36,8 @@
 #include "player/autogg.hpp"
 #include "player/autoreq.hpp"
 #include "performance/entityculling.hpp"
+#include "performance/particleoptimizer.hpp"
+#include "visual/outlinergb.hpp"
 
 ModuleRegistry& ModuleRegistry::get() {
     static ModuleRegistry registry;
@@ -115,5 +117,7 @@ void registerAllModules() {
     registry.emplace<LightOverlayModule>();
     registry.emplace<ShulkerPreviewModule>();
     registry.emplace<ConnectedGlassModule>();
+    registry.emplace<ParticleOptimizerModule>();
+    registry.emplace<OutlineRGBModule>();
     
 }
