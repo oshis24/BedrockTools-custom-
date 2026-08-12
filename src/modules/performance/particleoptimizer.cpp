@@ -4,12 +4,13 @@
 
 #include <android/asset_manager.h>
 
-#include <algorithm>
 #include <array>
-#include <cstddef>
-#include <cstring>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <dlfcn.h>
 #include <string_view>
+#include <thread>
 
 namespace {
 
@@ -19,26 +20,23 @@ using AAssetManagerOpenFn =
 ParticleOptimizerModule* g_module = nullptr;
 
 AAssetManagerOpenFn g_openOriginal = nullptr;
-
 bedrocktools::hooks::Handle g_openHook = nullptr;
 
-bool g_initialized = false;
+std::atomic_bool g_workerStarted = false;
+std::atomic_bool g_hookInstalled = false;
 
 
 /*
- * We deliberately use the same basic idea as the reference
- * implementation:
+ * This is deliberately not a real Minecraft asset.
  *
- *     matched material
- *          ↓
- *     original AAssetManager_open()
- *          ↓
- *     non-existent sentinel asset
+ * RE of the old UnViableTweaks hook shows that after a
+ * matched material it redirects AAssetManager_open() to
+ * a non-existent filename. The pointer lands in the
+ * "form" substring of the nearby static string data.
  *
- * We do NOT return nullptr directly.
+ * Using a short non-existent filename is sufficient.
  */
-constexpr const char* kDisabledAsset =
-    "__bedrocktools_disabled_material__";
+constexpr std::string_view kDisabledAsset = "form";
 
 
 struct MaterialRule {
@@ -48,60 +46,61 @@ struct MaterialRule {
 
 
 /*
- * Material names confirmed during RE.
+ * Material names found in the old implementation.
  */
-constexpr std::array<MaterialRule, 9> kRules{{
-    {&ParticleOptimizerModule::noParticles,
-        "Particle.material.bin"},
+constexpr std::array<MaterialRule, 11> kRules{{
+    {
+        &ParticleOptimizerModule::noParticles,
+        "Particle.material.bin"
+    },
+    {
+        &ParticleOptimizerModule::noParticles,
+        "ParticlePrepass.material.bin"
+    },
+    {
+        &ParticleOptimizerModule::noParticles,
+        "ParticleForwardPBR.material.bin"
+    },
 
-    {&ParticleOptimizerModule::noParticles,
-        "ParticlePrepass.material.bin"},
+    {
+        &ParticleOptimizerModule::noFlipbook,
+        "Flipbook.material.bin"
+    },
 
-    {&ParticleOptimizerModule::noParticles,
-        "ParticleForwardPBR.material.bin"},
+    {
+        &ParticleOptimizerModule::noShadow,
+        "ShadowOverlay.material.bin"
+    },
 
-    {&ParticleOptimizerModule::noFlipbook,
-        "Flipbook.material.bin"},
+    {
+        &ParticleOptimizerModule::noWeather,
+        "Weather.material.bin"
+    },
+    {
+        &ParticleOptimizerModule::noWeather,
+        "WeatherForwardPBR.material.bin"
+    },
 
-    {&ParticleOptimizerModule::noShadow,
-        "ShadowOverlay.material.bin"},
+    {
+        &ParticleOptimizerModule::noStars,
+        "Stars.material.bin"
+    },
+    {
+        &ParticleOptimizerModule::noStars,
+        "StarsForwardPBR.material.bin"
+    },
 
-    {&ParticleOptimizerModule::noWeather,
-        "Weather.material.bin"},
-
-    {&ParticleOptimizerModule::noWeather,
-        "WeatherForwardPBR.material.bin"},
-
-    {&ParticleOptimizerModule::noStars,
-        "Stars.material.bin"},
-
-    {&ParticleOptimizerModule::noStars,
-        "StarsForwardPBR.material.bin"}
+    {
+        &ParticleOptimizerModule::noSunMoon,
+        "SunMoon.material.bin"
+    },
+    {
+        &ParticleOptimizerModule::noSunMoon,
+        "SunMoonForwardPBR.material.bin"
+    }
 }};
 
 
-/*
- * Separate rules for Sun/Moon because the array above is
- * intentionally compact and easy to extend.
- */
-constexpr std::array<MaterialRule, 2> kSunMoonRules{{
-    {&ParticleOptimizerModule::noSunMoon,
-        "SunMoon.material.bin"},
-
-    {&ParticleOptimizerModule::noSunMoon,
-        "SunMoonForwardPBR.material.bin"}
-}};
-
-
-/*
- * Extract only the final filename component.
- *
- * The reference implementation uses std::filesystem::path
- * and then filename().
- *
- * We do the equivalent without constructing filesystem
- * objects on every asset request.
- */
 std::string_view baseName(
     const char* filename
 ) {
@@ -116,18 +115,12 @@ std::string_view baseName(
     if (slash == std::string_view::npos)
         return path;
 
-    return path.substr(slash + 1);
+    return path.substr(
+        slash + 1
+    );
 }
 
 
-/*
- * Match the final component rather than relying on one
- * specific absolute/relative path.
- *
- * This preserves the important portability property of
- * the old mod: all known path variants collapse to the
- * same filename.
- */
 bool shouldDisable(
     ParticleOptimizerModule* module,
     const char* filename
@@ -141,54 +134,45 @@ bool shouldDisable(
     if (name.empty())
         return false;
 
-
     for (const auto& rule : kRules) {
-        if (name == rule.name &&
-            module->*(rule.flag)) {
-
+        if (
+            name == rule.name &&
+            module->*(rule.flag)
+        ) {
             return true;
         }
     }
-
-
-    for (const auto& rule : kSunMoonRules) {
-        if (name == rule.name &&
-            module->*(rule.flag)) {
-
-            return true;
-        }
-    }
-
 
     return false;
 }
 
 
 /*
- * AAssetManager_open detour.
+ * AAssetManager_open hook.
+ *
+ * This hook is intentionally very cheap:
+ *
+ *     disabled
+ *          -> original()
+ *
+ *     enabled + non-target
+ *          -> original(filename)
+ *
+ *     enabled + target
+ *          -> original("form")
  */
 AAsset* assetOpenHook(
     AAssetManager* manager,
     const char* filename,
     int mode
 ) {
-    /*
-     * Fail open:
-     * if the module/original is unavailable, preserve
-     * normal Minecraft behaviour.
-     */
     if (!g_openOriginal)
         return nullptr;
 
-
-    /*
-     * The hook remains installed while the module is disabled.
-     * This makes module enable/disable safe without having to
-     * repeatedly patch a system library.
-     */
-    if (!g_module ||
-        !g_module->enabled) {
-
+    if (
+        !g_module ||
+        !g_module->enabled
+    ) {
         return g_openOriginal(
             manager,
             filename,
@@ -196,34 +180,18 @@ AAsset* assetOpenHook(
         );
     }
 
-
-    /*
-     * Only inspect the asset name when at least one relevant
-     * switch is enabled.
-     */
-    if (shouldDisable(
+    if (
+        shouldDisable(
             g_module,
             filename
-        )) {
-
-        /*
-         * This follows the reference mod's behaviour:
-         *
-         *     matched real asset
-         *             ↓
-         *     replace filename
-         *             ↓
-         *     original AAssetManager_open
-         *
-         * The sentinel is intentionally not a real asset.
-         */
+        )
+    ) {
         return g_openOriginal(
             manager,
-            kDisabledAsset,
+            kDisabledAsset.data(),
             mode
         );
     }
-
 
     return g_openOriginal(
         manager,
@@ -233,52 +201,102 @@ AAsset* assetOpenHook(
 }
 
 
-void installHook() {
-    if (g_initialized)
-        return;
+/*
+ * The reference implementation waits for libandroid.so
+ * instead of forcing the library to load.
+ *
+ * Observed behaviour:
+ *
+ *     dlopen(..., RTLD_NOW | RTLD_NOLOAD)
+ *     retry
+ *     sleep ~100 ms
+ *     up to roughly 100 attempts
+ */
+void assetHookWorker() {
+    constexpr int kAttempts = 100;
+    constexpr auto kDelay =
+        std::chrono::milliseconds(100);
 
-    auto libandroid =
-        bedrocktools::hooks::openLibrary(
-            "libandroid.so"
+    for (
+        int attempt = 0;
+        attempt < kAttempts;
+        ++attempt
+    ) {
+        if (g_hookInstalled.load(
+                std::memory_order_acquire
+            )) {
+            return;
+        }
+
+        void* libandroid =
+            dlopen(
+                "libandroid.so",
+                RTLD_NOW | RTLD_NOLOAD
+            );
+
+        if (libandroid) {
+
+            void* symbol =
+                dlsym(
+                    libandroid,
+                    "AAssetManager_open"
+                );
+
+            if (symbol) {
+
+                auto hook =
+                    bedrocktools::hooks::install(
+                        symbol,
+                        reinterpret_cast<void*>(
+                            assetOpenHook
+                        ),
+                        reinterpret_cast<void**>(
+                            &g_openOriginal
+                        )
+                    );
+
+                if (
+                    hook &&
+                    g_openOriginal
+                ) {
+                    g_openHook = hook;
+
+                    g_hookInstalled.store(
+                        true,
+                        std::memory_order_release
+                    );
+
+                    dlclose(libandroid);
+                    return;
+                }
+            }
+
+            dlclose(libandroid);
+        }
+
+        std::this_thread::sleep_for(
+            kDelay
         );
-
-    if (!libandroid)
-        return;
-
-
-    const auto address =
-        bedrocktools::hooks::symbol(
-            libandroid,
-            "AAssetManager_open"
-        );
+    }
+}
 
 
-    if (!address) {
-        bedrocktools::hooks::closeLibrary(
-            libandroid
-        );
+void startWorker() {
+    bool expected = false;
+
+    if (
+        !g_workerStarted.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_acq_rel
+        )
+    ) {
         return;
     }
 
-
-    g_openHook =
-        bedrocktools::hooks::install(
-            reinterpret_cast<void*>(address),
-            reinterpret_cast<void*>(assetOpenHook),
-            reinterpret_cast<void**>(
-                &g_openOriginal
-            )
-        );
-
-
-    bedrocktools::hooks::closeLibrary(
-        libandroid
-    );
-
-
-    g_initialized =
-        g_openHook != nullptr &&
-        g_openOriginal != nullptr;
+    std::thread(
+        assetHookWorker
+    ).detach();
 }
 
 } // namespace
@@ -287,7 +305,7 @@ void installHook() {
 ParticleOptimizerModule::ParticleOptimizerModule()
     : Module(
         "Particle Optimizer",
-        "Disables selected Minecraft material effects to reduce rendering workload."
+        "Disables selected particle and material effects."
     ) {
     g_module = this;
 }
@@ -295,11 +313,11 @@ ParticleOptimizerModule::ParticleOptimizerModule()
 
 ParticleOptimizerModule::~ParticleOptimizerModule() {
     /*
-     * We intentionally keep the system-library hook installed
-     * for the lifetime of BedrockTools.
+     * BedrockTools owns modules for the lifetime of the
+     * runtime, so the system hook remains installed.
      *
-     * The detour becomes a transparent pass-through when the
-     * module is disabled.
+     * The detour becomes a transparent pass-through when
+     * this module is disabled.
      */
     if (g_module == this)
         g_module = nullptr;
@@ -307,24 +325,23 @@ ParticleOptimizerModule::~ParticleOptimizerModule() {
 
 
 void ParticleOptimizerModule::onInit() {
-    installHook();
+    /*
+     * IMPORTANT:
+     *
+     * Do not block ModuleRegistry::initialize().
+     *
+     * The reference implementation installs this hook
+     * asynchronously after libandroid is available.
+     */
+    startWorker();
 }
 
 
 void ParticleOptimizerModule::onEnable() {
-    /*
-     * Nothing else is required.
-     *
-     * The installed hook reads the current module state.
-     */
 }
 
 
 void ParticleOptimizerModule::onDisable() {
-    /*
-     * Keep hook installed and become a transparent
-     * AAssetManager_open pass-through.
-     */
 }
 
 
