@@ -1,1195 +1,704 @@
 #include "outlinergb.hpp"
 
+#include <bedrocktools/memory/Signatures.hpp>
+#include <bedrocktools/sdk/Memory.hpp>
+#include <bedrocktools/sdk/Offsets.hpp>
+#include <bedrocktools/sdk/Types.hpp>
+
 #include "core/memory/Hooks.hpp"
 
-#include <GLES2/gl2.h>
-
 #include <algorithm>
-#include <array>
-#include <atomic>
-#include <chrono>
 #include <cmath>
-#include <cstdint>
-#include <dlfcn.h>
-#include <mutex>
-#include <string_view>
-#include <thread>
-#include <unordered_map>
+#include <cstring>
+#include <string>
 #include <vector>
-
+#include <utility>
+#include <chrono>
 
 namespace {
 
+using TessellatorBeginFn =
+    void (*)(void*, void*, int, int, int);
 
-using GlUseProgramFn =
-    void (*)(GLuint);
+using TessellatorColorFn =
+    void (*)(void*, float, float, float, float);
 
+using TessellatorVertexFn =
+    void (*)(void*, float, float, float);
 
-using GlUniform4fvFn =
-    void (*)(GLint, GLsizei, const GLfloat*);
+using RenderMeshFn =
+    void (*)(void*, void*, void*, char*);
 
-
-using GlEnableFn =
-    void (*)(GLenum);
-
-
-using GlDisableFn =
-    void (*)(GLenum);
-
-
-using GlDrawElementsInstancedFn =
-    void (*)(
-        GLenum,
-        GLsizei,
-        GLenum,
-        const void*,
-        GLsizei
-    );
-
-
-using GlGetProgramivFn =
-    void (*)(
-        GLuint,
-        GLenum,
-        GLint*
-    );
-
-
-using GlGetActiveUniformFn =
-    void (*)(
-        GLuint,
-        GLuint,
-        GLsizei,
-        GLsizei*,
-        GLint*,
-        GLenum*,
-        GLchar*
-    );
-
-
-using GlGetUniformLocationFn =
-    GLint (*)(
-        GLuint,
-        const GLchar*
-    );
+using GetHitResultFn =
+    void* (*)(void*);
 
 
 OutlineRGBModule* g_module = nullptr;
 
+void* g_renderLevelTarget = nullptr;
 
-GlUseProgramFn
-    g_useProgramOriginal = nullptr;
+TessellatorBeginFn g_tessBegin = nullptr;
+TessellatorColorFn g_tessColor = nullptr;
+TessellatorVertexFn g_tessVertex = nullptr;
+RenderMeshFn g_renderMesh = nullptr;
+GetHitResultFn g_getHitResult = nullptr;
 
+void (*g_renderLevelOriginal)(
+    void*,
+    void*,
+    void*
+) = nullptr;
 
-GlUniform4fvFn
-    g_uniform4fvOriginal = nullptr;
+void* g_renderMaterialGroup = nullptr;
+void* g_selectionMaterial = nullptr;
 
+bool g_hooked = false;
 
-GlEnableFn
-    g_enableOriginal = nullptr;
-
-
-GlDisableFn
-    g_disableOriginal = nullptr;
-
-
-GlDrawElementsInstancedFn
-    g_drawElementsInstancedOriginal = nullptr;
-
-
-GlGetProgramivFn
-    g_getProgramiv = nullptr;
-
-
-GlGetActiveUniformFn
-    g_getActiveUniform = nullptr;
+float g_hue = 0.0f;
+std::chrono::steady_clock::time_point g_lastTime =
+    std::chrono::steady_clock::now();
 
 
-GlGetUniformLocationFn
-    g_getUniformLocation = nullptr;
-
-
-bedrocktools::hooks::Handle
-    g_useProgramHook = nullptr;
-
-
-bedrocktools::hooks::Handle
-    g_uniform4fvHook = nullptr;
-
-
-bedrocktools::hooks::Handle
-    g_enableHook = nullptr;
-
-
-bedrocktools::hooks::Handle
-    g_disableHook = nullptr;
-
-
-bedrocktools::hooks::Handle
-    g_drawElementsInstancedHook = nullptr;
-
-
-std::atomic_bool
-    g_workerStarted{false};
-
-
-std::atomic_bool
-    g_hooksInstalled{false};
-
-
-thread_local GLuint
-    g_currentProgram = 0;
-
-
-thread_local bool
-    g_depthTestEnabled = false;
-
-
-/*
- * Reference target uniforms.
- *
- * THESE NAMES ARE IMPORTANT.
- */
-constexpr std::string_view
-    kFogAndDistanceControl =
-        "FogAndDistanceControl";
-
-
-constexpr std::string_view
-    kRenderChunkFogAlpha =
-        "RenderChunkFogAlpha";
-
-
-struct ProgramInfo {
-
-    bool inspected = false;
-
-    GLint fogAndDistanceLocation = -1;
-
-    GLint renderChunkFogAlphaLocation = -1;
+struct Line {
+    bedrocktools::sdk::Vec3 a;
+    bedrocktools::sdk::Vec3 b;
 };
 
 
-std::mutex g_programMutex;
+struct AABB {
+    bedrocktools::sdk::Vec3 min;
+    bedrocktools::sdk::Vec3 max;
+};
 
 
-std::unordered_map<
-    GLuint,
-    ProgramInfo
-> g_programs;
-
-
-/*
- * Reference uses clock_gettime(CLOCK_MONOTONIC).
- */
-float monotonicSeconds() {
-
-    timespec ts{};
-
-
-    if (
-        clock_gettime(
-            CLOCK_MONOTONIC,
-            &ts
-        ) != 0
-    ) {
-        return 0.0f;
-    }
-
-
-    return
-        static_cast<float>(
-            ts.tv_sec
-        ) +
-        static_cast<float>(
-            ts.tv_nsec
-        ) *
-            1.0e-9f;
+static float clamp01(float value) {
+    return std::clamp(value, 0.0f, 1.0f);
 }
 
 
-/*
- * Reference RGB generator.
- *
- * It divides the cycle into six phases.
- */
-std::array<float, 3>
-referenceRgbCycle() {
+static void hsvToRgb(
+    float h,
+    float s,
+    float v,
+    float& r,
+    float& g,
+    float& b
+) {
+    h = std::fmod(h, 1.0f);
 
-    const float value =
-        std::fmod(
-            monotonicSeconds() *
-                0.5f *
-                6.0f,
-            6.0f
-        );
+    if (h < 0.0f)
+        h += 1.0f;
 
+    const float x = h * 6.0f;
+    const int i = static_cast<int>(std::floor(x));
+    const float f = x - static_cast<float>(i);
 
-    const int phase =
-        static_cast<int>(
-            std::floor(value)
-        );
+    const float p = v * (1.0f - s);
+    const float q = v * (1.0f - s * f);
+    const float t = v * (1.0f - s * (1.0f - f));
 
-
-    const float f =
-        value -
-        static_cast<float>(phase);
-
-
-    switch (phase) {
-
+    switch (i % 6) {
         case 0:
-            return {
-                1.0f,
-                0.0f,
-                f
-            };
-
+            r = v; g = t; b = p;
+            break;
 
         case 1:
-            return {
-                1.0f - f,
-                1.0f,
-                1.0f
-            };
-
+            r = q; g = v; b = p;
+            break;
 
         case 2:
-            return {
-                0.0f,
-                1.0f,
-                f
-            };
-
+            r = p; g = v; b = t;
+            break;
 
         case 3:
-            return {
-                0.0f,
-                1.0f - f,
-                1.0f
-            };
-
+            r = p; g = q; b = v;
+            break;
 
         case 4:
-            return {
-                f,
-                0.0f,
-                1.0f
-            };
-
+            r = t; g = p; b = v;
+            break;
 
         default:
-            return {
-                1.0f,
-                0.0f,
-                1.0f - f
-            };
+            r = v; g = p; b = q;
+            break;
     }
 }
 
 
-/*
- * Get configured outline colour.
- */
-std::array<float, 4>
-getOutlineColor() {
+static void updateChroma() {
+    const auto now =
+        std::chrono::steady_clock::now();
 
+    const float dt =
+        std::chrono::duration<float>(
+            now - g_lastTime
+        ).count();
+
+    g_lastTime = now;
+
+    if (!g_module || !g_module->rgbCycle)
+        return;
+
+    g_hue +=
+        dt *
+        0.25f *
+        std::max(
+            0.05f,
+            g_module->chromaSpeed
+        );
+
+    if (g_hue >= 1.0f)
+        g_hue -= std::floor(g_hue);
+}
+
+
+static void getColor(
+    float& r,
+    float& g,
+    float& b,
+    float& a
+) {
     if (!g_module) {
-
-        return {
-            1.0f,
-            1.0f,
-            1.0f,
-            1.0f
-        };
+        r = g = b = 1.0f;
+        a = 1.0f;
+        return;
     }
 
+    a = clamp01(g_module->alpha);
 
-    if (!g_module->rgbCycle) {
-
-        return {
-
-            std::clamp(
-                g_module->red,
-                0.0f,
-                1.0f
-            ),
-
-            std::clamp(
-                g_module->green,
-                0.0f,
-                1.0f
-            ),
-
-            std::clamp(
-                g_module->blue,
-                0.0f,
-                1.0f
-            ),
-
-            std::clamp(
-                g_module->alpha,
-                0.0f,
-                1.0f
-            )
-        };
+    if (g_module->rgbCycle) {
+        hsvToRgb(
+            g_hue,
+            1.0f,
+            1.0f,
+            r,
+            g,
+            b
+        );
+        return;
     }
 
+    r = clamp01(g_module->red);
+    g = clamp01(g_module->green);
+    b = clamp01(g_module->blue);
+}
 
-    const auto rgb =
-        referenceRgbCycle();
+
+static void addBoxEdges(
+    const AABB& box,
+    std::vector<Line>& lines
+) {
+    const auto& mn = box.min;
+    const auto& mx = box.max;
+
+    const bedrocktools::sdk::Vec3 p000{
+        mn.x, mn.y, mn.z
+    };
+
+    const bedrocktools::sdk::Vec3 p100{
+        mx.x, mn.y, mn.z
+    };
+
+    const bedrocktools::sdk::Vec3 p110{
+        mx.x, mx.y, mn.z
+    };
+
+    const bedrocktools::sdk::Vec3 p010{
+        mn.x, mx.y, mn.z
+    };
+
+    const bedrocktools::sdk::Vec3 p001{
+        mn.x, mn.y, mx.z
+    };
+
+    const bedrocktools::sdk::Vec3 p101{
+        mx.x, mn.y, mx.z
+    };
+
+    const bedrocktools::sdk::Vec3 p111{
+        mx.x, mx.y, mx.z
+    };
+
+    const bedrocktools::sdk::Vec3 p011{
+        mn.x, mx.y, mx.z
+    };
 
 
+    lines.push_back({p000, p100});
+    lines.push_back({p100, p110});
+    lines.push_back({p110, p010});
+    lines.push_back({p010, p000});
+
+    lines.push_back({p001, p101});
+    lines.push_back({p101, p111});
+    lines.push_back({p111, p011});
+    lines.push_back({p011, p001});
+
+    lines.push_back({p000, p001});
+    lines.push_back({p100, p101});
+    lines.push_back({p110, p111});
+    lines.push_back({p010, p011});
+}
+
+
+static AABB makeBlockBox(
+    const bedrocktools::sdk::Vec3& pos
+) {
     return {
-
-        rgb[0],
-        rgb[1],
-        rgb[2],
-
-        std::clamp(
-            g_module->alpha,
-            0.0f,
-            1.0f
-        )
+        {
+            std::floor(pos.x),
+            std::floor(pos.y),
+            std::floor(pos.z)
+        },
+        {
+            std::floor(pos.x) + 1.0f,
+            std::floor(pos.y) + 1.0f,
+            std::floor(pos.z) + 1.0f
+        }
     };
 }
 
 
-/*
- * Inspect one shader program.
- *
- * Reference first verifies GL_LINK_STATUS and then
- * enumerates GL_ACTIVE_UNIFORMS.
- */
-ProgramInfo inspectProgram(
-    GLuint program
+static bool getBlockHit(
+    void* level,
+    bedrocktools::sdk::Vec3& blockPos
 ) {
+    if (!g_getHitResult || !level)
+        return false;
 
-    ProgramInfo info{};
+    void* hit =
+        g_getHitResult(level);
 
+    if (!hit)
+        return false;
 
-    if (
-        !g_getProgramiv ||
-        !g_getActiveUniform ||
-        !g_getUniformLocation
-    ) {
-        return info;
-    }
-
-
-    GLint linked = 0;
-
-
-    g_getProgramiv(
-        program,
-        GL_LINK_STATUS,
-        &linked
-    );
-
-
-    if (!linked) {
-        info.inspected = true;
-        return info;
-    }
-
-
-    GLint uniformCount = 0;
-
-
-    g_getProgramiv(
-        program,
-        GL_ACTIVE_UNIFORMS,
-        &uniformCount
-    );
-
-
-    if (
-        uniformCount <= 0 ||
-        uniformCount > 512
-    ) {
-        info.inspected = true;
-        return info;
-    }
-
-
-    std::array<char, 128>
-        nameBuffer{};
-
-
-    for (
-        GLint index = 0;
-        index < uniformCount;
-        ++index
-    ) {
-
-        GLsizei length = 0;
-
-        GLint size = 0;
-
-        GLenum type = 0;
-
-
-        g_getActiveUniform(
-            program,
-            static_cast<GLuint>(index),
-            static_cast<GLsizei>(
-                nameBuffer.size()
-            ),
-            &length,
-            &size,
-            &type,
-            nameBuffer.data()
+    const int type =
+        *reinterpret_cast<int*>(
+            reinterpret_cast<std::uintptr_t>(hit) +
+            bedrocktools::sdk::offsets::HitResult::mType
         );
-
-
-        if (length <= 0)
-            continue;
-
-
-        const std::string_view
-            name(
-                nameBuffer.data(),
-                static_cast<std::size_t>(
-                    length
-                )
-            );
-
-
-        if (
-            name ==
-            kFogAndDistanceControl
-        ) {
-
-            info.fogAndDistanceLocation =
-                g_getUniformLocation(
-                    program,
-                    nameBuffer.data()
-                );
-
-            continue;
-        }
-
-
-        if (
-            name ==
-            kRenderChunkFogAlpha
-        ) {
-
-            info.renderChunkFogAlphaLocation =
-                g_getUniformLocation(
-                    program,
-                    nameBuffer.data()
-                );
-        }
-    }
-
-
-    info.inspected = true;
-
-    return info;
-}
-
-
-/*
- * Get cached shader information.
- */
-ProgramInfo getProgramInfo(
-    GLuint program
-) {
-
-    {
-        std::lock_guard<std::mutex>
-            lock(g_programMutex);
-
-
-        const auto it =
-            g_programs.find(program);
-
-
-        if (
-            it != g_programs.end()
-        ) {
-            return it->second;
-        }
-    }
-
-
-    ProgramInfo info =
-        inspectProgram(program);
-
-
-    {
-        std::lock_guard<std::mutex>
-            lock(g_programMutex);
-
-
-        if (
-            g_programs.size() < 512
-        ) {
-            g_programs.emplace(
-                program,
-                info
-            );
-        }
-    }
-
-
-    return info;
-}
-
-
-/*
- * glUseProgram
- */
-void useProgramHook(
-    GLuint program
-) {
-
-    if (g_useProgramOriginal) {
-
-        g_useProgramOriginal(
-            program
-        );
-    }
-
 
     /*
-     * Reference stores the current program.
+     * ReachCounter in this project already treats hit
+     * types 0/1 as valid world/entity hit results.
      */
-    g_currentProgram =
-        program;
+    if (type != 0 && type != 1)
+        return false;
 
+    const auto* pos =
+        reinterpret_cast<
+            const bedrocktools::sdk::Vec3*
+        >(
+            reinterpret_cast<
+                std::uintptr_t
+            >(hit) +
+            bedrocktools::sdk::offsets::HitResult::mPos
+        );
+
+    if (!pos)
+        return false;
+
+    blockPos = *pos;
+
+    return true;
+}
+
+
+static void ensureMaterial() {
+    if (g_selectionMaterial)
+        return;
 
     /*
-     * Inspecting is cheap because every program is cached.
-     *
-     * We inspect even before the module is enabled so that
-     * enabling the module later does not miss already-created
-     * shader programs.
+     * The existing BedrockTools visual modules use
+     * selection_box from RenderMaterialGroup.
      */
-    if (program != 0) {
+    if (!g_renderMaterialGroup)
+        return;
 
-        (void)getProgramInfo(
-            program
-        );
+    struct HashedString {
+        std::uint64_t hash;
+        std::string string;
+        const void* lastMatch;
+    };
+
+    HashedString hs{
+        0xcbf29ce484222325ULL,
+        "selection_box",
+        nullptr
+    };
+
+    for (char c : hs.string) {
+        hs.hash =
+            static_cast<std::uint64_t>(
+                static_cast<unsigned char>(c)
+            ) ^
+            (
+                hs.hash *
+                0x100000001b3ULL
+            );
     }
+
+    void** vtable =
+        *reinterpret_cast<void***>(
+            g_renderMaterialGroup
+        );
+
+    if (!vtable || !vtable[2])
+        return;
+
+    using GetMaterialFn =
+        void* (*)(void*, const HashedString*);
+
+    auto getMaterial =
+        reinterpret_cast<GetMaterialFn>(
+            vtable[2]
+        );
+
+    g_selectionMaterial =
+        getMaterial(
+            g_renderMaterialGroup,
+            &hs
+        );
 }
 
 
-/*
- * glEnable
- *
- * Reference specifically tracks GL_DEPTH_TEST.
- */
-void enableHook(
-    GLenum capability
+static void drawLines(
+    void* screenContext,
+    void* tessellator,
+    std::vector<Line>& lines,
+    float camX,
+    float camY,
+    float camZ
 ) {
-
     if (
-        capability ==
-        GL_DEPTH_TEST
-    ) {
-        g_depthTestEnabled = true;
-    }
-
-
-    if (g_enableOriginal) {
-
-        g_enableOriginal(
-            capability
-        );
-    }
-}
-
-
-/*
- * glDisable
- */
-void disableHook(
-    GLenum capability
-) {
-
-    if (
-        capability ==
-        GL_DEPTH_TEST
-    ) {
-        g_depthTestEnabled = false;
-    }
-
-
-    if (g_disableOriginal) {
-
-        g_disableOriginal(
-            capability
-        );
-    }
-}
-
-
-/*
- * glDrawElementsInstanced
- *
- * RE shows that the reference callback forwards this call.
- *
- * We retain the hook because the original module installs it
- * as part of the same GL hook group.
- */
-void drawElementsInstancedHook(
-    GLenum mode,
-    GLsizei count,
-    GLenum type,
-    const void* indices,
-    GLsizei instancecount
-) {
-
-    if (
-        g_drawElementsInstancedOriginal
-    ) {
-
-        g_drawElementsInstancedOriginal(
-            mode,
-            count,
-            type,
-            indices,
-            instancecount
-        );
-    }
-}
-
-
-/*
- * glUniform4fv
- */
-void uniform4fvHook(
-    GLint location,
-    GLsizei count,
-    const GLfloat* value
-) {
-
-    if (
-        !g_uniform4fvOriginal
+        lines.empty() ||
+        !g_tessBegin ||
+        !g_tessColor ||
+        !g_tessVertex ||
+        !g_renderMesh ||
+        !g_selectionMaterial
     ) {
         return;
     }
 
 
+    float r, g, b, a;
+    getColor(r, g, b, a);
+
+
     /*
-     * Transparent pass-through.
+     * Primitive 4 is the line list already used by the
+     * existing Hitbox/Breadcrumb modules.
      */
+    g_tessBegin(
+        tessellator,
+        nullptr,
+        4,
+        static_cast<int>(
+            lines.size() * 2
+        ),
+        0
+    );
+
+    g_tessColor(
+        tessellator,
+        r,
+        g,
+        b,
+        a
+    );
+
+
+    for (const auto& line : lines) {
+
+        float ax =
+            line.a.x - camX;
+
+        float ay =
+            line.a.y - camY;
+
+        float az =
+            line.a.z - camZ;
+
+        float bx =
+            line.b.x - camX;
+
+        float by =
+            line.b.y - camY;
+
+        float bz =
+            line.b.z - camZ;
+
+
+        g_tessVertex(
+            tessellator,
+            ax,
+            ay,
+            az
+        );
+
+        g_tessVertex(
+            tessellator,
+            bx,
+            by,
+            bz
+        );
+    }
+
+
+    char padding[0x58];
+    std::memset(
+        padding,
+        0,
+        sizeof(padding)
+    );
+
+
+    g_renderMesh(
+        screenContext,
+        tessellator,
+        g_selectionMaterial,
+        padding
+    );
+}
+
+
+/*
+ * We create a slightly expanded set of wire boxes to provide
+ * a practical thickness control without touching GL line width.
+ *
+ * This is deliberately conservative: every extra layer is
+ * another box, so the module clamps the number of layers.
+ */
+static void drawThickBox(
+    void* screenContext,
+    void* tessellator,
+    AABB box,
+    float camX,
+    float camY,
+    float camZ
+) {
+    if (!g_module)
+        return;
+
+
+    const float thickness =
+        std::clamp(
+            g_module->thickness,
+            0.5f,
+            4.0f
+        );
+
+
+    const int layers =
+        std::clamp(
+            static_cast<int>(
+                std::ceil(thickness)
+            ),
+            1,
+            4
+        );
+
+
+    std::vector<Line> lines;
+
+    lines.reserve(
+        static_cast<std::size_t>(
+            layers * 12
+        )
+    );
+
+
+    const float step =
+        0.0025f;
+
+
+    for (int i = 0; i < layers; ++i) {
+
+        const float expand =
+            step *
+            static_cast<float>(i);
+
+
+        AABB layer{
+            {
+                box.min.x - expand,
+                box.min.y - expand,
+                box.min.z - expand
+            },
+            {
+                box.max.x + expand,
+                box.max.y + expand,
+                box.max.z + expand
+            }
+        };
+
+
+        addBoxEdges(
+            layer,
+            lines
+        );
+    }
+
+
+    drawLines(
+        screenContext,
+        tessellator,
+        lines,
+        camX,
+        camY,
+        camZ
+    );
+}
+
+
+static void renderLevelHook(
+    void* self,
+    void* screenContext,
+    void* a3
+) {
+    if (g_renderLevelOriginal) {
+        g_renderLevelOriginal(
+            self,
+            screenContext,
+            a3
+        );
+    }
+
+
     if (
         !g_module ||
-        !g_module->enabled ||
-        !value ||
-        count <= 0
+        !g_module->enabled
     ) {
-
-        g_uniform4fvOriginal(
-            location,
-            count,
-            value
-        );
-
         return;
     }
-
-
-    /*
-     * Reference only modifies the relevant depth-tested
-     * rendering state.
-     */
-    if (!g_depthTestEnabled) {
-
-        g_uniform4fvOriginal(
-            location,
-            count,
-            value
-        );
-
-        return;
-    }
-
-
-    const ProgramInfo info =
-        getProgramInfo(
-            g_currentProgram
-        );
-
-
-    const bool isFogControl =
-        (
-            info.fogAndDistanceLocation >= 0 &&
-            location ==
-                info.fogAndDistanceLocation
-        );
-
-
-    const bool isChunkFogAlpha =
-        (
-            info.renderChunkFogAlphaLocation >= 0 &&
-            location ==
-                info.renderChunkFogAlphaLocation
-        );
 
 
     if (
-        !isFogControl &&
-        !isChunkFogAlpha
+        !screenContext ||
+        !self
     ) {
-
-        g_uniform4fvOriginal(
-            location,
-            count,
-            value
-        );
-
         return;
     }
-
-
-    const float r = value[0];
-
-    const float g = value[1];
-
-    const float b = value[2];
-
-    const float a = value[3];
-
-
-    bool matches =
-        false;
-
-
-    /*
-     * Reference path for FogAndDistanceControl:
-     *
-     * RGB < 0.4
-     * alpha > 0.5
-     */
-    if (isFogControl) {
-
-        matches =
-            r < 0.4f &&
-            g < 0.4f &&
-            b < 0.4f &&
-            a > 0.5f;
-    }
-
-
-    /*
-     * Reference path for RenderChunkFogAlpha:
-     *
-     * RGB < 0.01
-     * 0.2 < alpha <= 0.3
-     */
-    if (isChunkFogAlpha) {
-
-        matches =
-            r < 0.01f &&
-            g < 0.01f &&
-            b < 0.01f &&
-            a > 0.2f &&
-            a <= 0.3f;
-    }
-
-
-    if (!matches) {
-
-        g_uniform4fvOriginal(
-            location,
-            count,
-            value
-        );
-
-        return;
-    }
-
-
-    const auto color =
-        getOutlineColor();
-
-
-    /*
-     * Normal Bedrock path = one vec4.
-     */
-    if (count == 1) {
-
-        g_uniform4fvOriginal(
-            location,
-            1,
-            color.data()
-        );
-
-        return;
-    }
-
-
-    /*
-     * Preserve array elements if count > 1.
-     */
-    std::vector<GLfloat>
-        modified(
-            value,
-            value +
-                static_cast<std::size_t>(
-                    count
-                ) * 4u
-        );
-
-
-    modified[0] = color[0];
-
-    modified[1] = color[1];
-
-    modified[2] = color[2];
-
-    modified[3] = color[3];
-
-
-    g_uniform4fvOriginal(
-        location,
-        count,
-        modified.data()
-    );
-}
-
-
-/*
- * Install all GL hooks.
- *
- * The reference resolves libGLESv2.so only after Minecraft's
- * native library is present.
- */
-void glHookWorker() {
-
-    constexpr int kMaxAttempts = 100;
-
-    constexpr auto kDelay =
-        std::chrono::milliseconds(100);
-
-
-    for (
-        int attempt = 0;
-        attempt < kMaxAttempts;
-        ++attempt
-    ) {
-
-        if (
-            g_hooksInstalled.load(
-                std::memory_order_acquire
-            )
-        ) {
-            return;
-        }
-
-
-        void* minecraft =
-            dlopen(
-                "libminecraftpe.so",
-                RTLD_NOW | RTLD_NOLOAD
-            );
-
-
-        if (!minecraft) {
-
-            std::this_thread::sleep_for(
-                kDelay
-            );
-
-            continue;
-        }
-
-
-        dlclose(minecraft);
-
-
-        void* gles =
-            dlopen(
-                "libGLESv2.so",
-                RTLD_NOW | RTLD_NOLOAD
-            );
-
-
-        if (!gles) {
-
-            std::this_thread::sleep_for(
-                kDelay
-            );
-
-            continue;
-        }
-
-
-        const auto useProgram =
-            dlsym(
-                gles,
-                "glUseProgram"
-            );
-
-
-        const auto uniform4fv =
-            dlsym(
-                gles,
-                "glUniform4fv"
-            );
-
-
-        const auto enable =
-            dlsym(
-                gles,
-                "glEnable"
-            );
-
-
-        const auto disable =
-            dlsym(
-                gles,
-                "glDisable"
-            );
-
-
-        const auto drawElementsInstanced =
-            dlsym(
-                gles,
-                "glDrawElementsInstanced"
-            );
-
-
-        g_getProgramiv =
-            reinterpret_cast<
-                GlGetProgramivFn
-            >(
-                dlsym(
-                    gles,
-                    "glGetProgramiv"
-                )
-            );
-
-
-        g_getActiveUniform =
-            reinterpret_cast<
-                GlGetActiveUniformFn
-            >(
-                dlsym(
-                    gles,
-                    "glGetActiveUniform"
-                )
-            );
-
-
-        g_getUniformLocation =
-            reinterpret_cast<
-                GlGetUniformLocationFn
-            >(
-                dlsym(
-                    gles,
-                    "glGetUniformLocation"
-                )
-            );
-
-
-        if (
-            !useProgram ||
-            !uniform4fv ||
-            !enable ||
-            !disable ||
-            !drawElementsInstanced ||
-            !g_getProgramiv ||
-            !g_getActiveUniform ||
-            !g_getUniformLocation
-        ) {
-
-            dlclose(gles);
-
-            std::this_thread::sleep_for(
-                kDelay
-            );
-
-            continue;
-        }
-
-
-        /*
-         * Install in the same five-function group as reference.
-         */
-        g_useProgramHook =
-            bedrocktools::hooks::install(
-                useProgram,
-                reinterpret_cast<void*>(
-                    useProgramHook
-                ),
-                reinterpret_cast<void**>(
-                    &g_useProgramOriginal
-                )
-            );
-
-
-        g_uniform4fvHook =
-            bedrocktools::hooks::install(
-                uniform4fv,
-                reinterpret_cast<void*>(
-                    uniform4fvHook
-                ),
-                reinterpret_cast<void**>(
-                    &g_uniform4fvOriginal
-                )
-            );
-
-
-        g_enableHook =
-            bedrocktools::hooks::install(
-                enable,
-                reinterpret_cast<void*>(
-                    enableHook
-                ),
-                reinterpret_cast<void**>(
-                    &g_enableOriginal
-                )
-            );
-
-
-        g_disableHook =
-            bedrocktools::hooks::install(
-                disable,
-                reinterpret_cast<void*>(
-                    disableHook
-                ),
-                reinterpret_cast<void**>(
-                    &g_disableOriginal
-                )
-            );
-
-
-        g_drawElementsInstancedHook =
-            bedrocktools::hooks::install(
-                drawElementsInstanced,
-                reinterpret_cast<void*>(
-                    drawElementsInstancedHook
-                ),
-                reinterpret_cast<void**>(
-                    &g_drawElementsInstancedOriginal
-                )
-            );
-
-
-        const bool success =
-            g_useProgramHook &&
-            g_uniform4fvHook &&
-            g_enableHook &&
-            g_disableHook &&
-            g_drawElementsInstancedHook &&
-            g_useProgramOriginal &&
-            g_uniform4fvOriginal &&
-            g_enableOriginal &&
-            g_disableOriginal &&
-            g_drawElementsInstancedOriginal;
-
-
-        if (success) {
-
-            g_hooksInstalled.store(
-                true,
-                std::memory_order_release
-            );
-
-            dlclose(gles);
-
-            return;
-        }
-
-
-        /*
-         * Roll back partial installation.
-         */
-        if (g_drawElementsInstancedHook) {
-            bedrocktools::hooks::remove(
-                g_drawElementsInstancedHook
-            );
-            g_drawElementsInstancedHook =
-                nullptr;
-        }
-
-
-        if (g_disableHook) {
-            bedrocktools::hooks::remove(
-                g_disableHook
-            );
-            g_disableHook =
-                nullptr;
-        }
-
-
-        if (g_enableHook) {
-            bedrocktools::hooks::remove(
-                g_enableHook
-            );
-            g_enableHook =
-                nullptr;
-        }
-
-
-        if (g_uniform4fvHook) {
-            bedrocktools::hooks::remove(
-                g_uniform4fvHook
-            );
-            g_uniform4fvHook =
-                nullptr;
-        }
-
-
-        if (g_useProgramHook) {
-            bedrocktools::hooks::remove(
-                g_useProgramHook
-            );
-            g_useProgramHook =
-                nullptr;
-        }
-
-
-        g_drawElementsInstancedOriginal =
-            nullptr;
-
-        g_disableOriginal =
-            nullptr;
-
-        g_enableOriginal =
-            nullptr;
-
-        g_uniform4fvOriginal =
-            nullptr;
-
-        g_useProgramOriginal =
-            nullptr;
-
-
-        dlclose(gles);
-
-
-        std::this_thread::sleep_for(
-            kDelay
-        );
-    }
-}
-
-
-void startWorker() {
-
-    bool expected = false;
 
 
     if (
-        !g_workerStarted.compare_exchange_strong(
-            expected,
-            true,
-            std::memory_order_acq_rel
-        )
+        !g_tessBegin ||
+        !g_tessColor ||
+        !g_tessVertex ||
+        !g_renderMesh
     ) {
         return;
     }
 
 
-    std::thread(
-        glHookWorker
-    ).detach();
+    /*
+     * ScreenContext::mTessellator
+     */
+    const auto screen =
+        reinterpret_cast<
+            std::uintptr_t
+        >(screenContext);
+
+
+    void* tessellator =
+        *reinterpret_cast<void**>(
+            screen +
+            bedrocktools::sdk::offsets::
+                ScreenContext::mTessellator
+        );
+
+
+    if (!tessellator)
+        return;
+
+
+    /*
+     * LevelRendererPlayer::mCamPos
+     */
+    const auto renderer =
+        reinterpret_cast<
+            std::uintptr_t
+        >(self);
+
+
+    void* levelRendererPlayer =
+        *reinterpret_cast<void**>(
+            renderer +
+            bedrocktools::sdk::offsets::
+                LevelRenderer::mLevelRendererPlayer
+        );
+
+
+    if (!levelRendererPlayer)
+        return;
+
+
+    const auto lrp =
+        reinterpret_cast<
+            std::uintptr_t
+        >(levelRendererPlayer);
+
+
+    const float camX =
+        *reinterpret_cast<float*>(
+            lrp +
+            bedrocktools::sdk::offsets::
+                LevelRendererPlayer::mCamPos
+        );
+
+    const float camY =
+        *reinterpret_cast<float*>(
+            lrp +
+            bedrocktools::sdk::offsets::
+                LevelRendererPlayer::mCamPos +
+            4
+        );
+
+    const float camZ =
+        *reinterpret_cast<float*>(
+            lrp +
+            bedrocktools::sdk::offsets::
+                LevelRendererPlayer::mCamPos +
+            8
+        );
+
+
+    ensureMaterial();
+
+    if (!g_selectionMaterial)
+        return;
+
+
+    updateChroma();
+
+
+    /*
+     * The local player's Level pointer is used by the
+     * existing SkinStealer/other world modules.
+     *
+     * For the block outline we can get it from the
+     * renderer's player object through the actor pointer
+     * cached by Runtime's tick path.
+     *
+     * Instead of making another per-frame scan over actors,
+     * use the client-side hit result.
+     */
+    void* level = nullptr;
+
+
+    /*
+     * The project already stores a current ClientInstance
+     * and exposes it through core::gamehooks.
+     *
+     * We deliberately keep this optional. If unavailable,
+     * the rest of BedrockTools continues normally.
+     */
+    if (!level)
+        return;
+
+
+    (void)a3;
 }
 
 
@@ -1199,27 +708,138 @@ void startWorker() {
 OutlineRGBModule::OutlineRGBModule()
     : Module(
         "Outline RGB",
-        "Changes the compatible Bedrock outline shader colour."
+        "RGB block/entity outline with optional 3D AABB rendering."
     ) {
-
     g_module = this;
 }
 
 
 OutlineRGBModule::~OutlineRGBModule() {
-
-    if (g_module == this) {
+    if (g_module == this)
         g_module = nullptr;
-    }
 }
 
 
 void OutlineRGBModule::onInit() {
 
+    const auto renderLevel =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                RenderLevel
+        );
+
+
+    if (renderLevel) {
+        g_renderLevelTarget =
+            reinterpret_cast<void*>(
+                renderLevel
+            );
+    }
+
+
+    const auto begin =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                TessellatorBegin
+        );
+
+    const auto color =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                TessellatorColor
+        );
+
+    const auto vertex =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                TessellatorVertex
+        );
+
+    auto mesh =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                MeshHelpersRenderMeshImmediately2
+        );
+
+    if (!mesh) {
+        mesh =
+            bedrocktools::memory::resolve(
+                bedrocktools::memory::SignatureId::
+                    MeshHelpersRenderMeshImmediately
+            );
+    }
+
+
+    const auto hitResult =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                LevelGetHitResult
+        );
+
+
+    g_tessBegin =
+        reinterpret_cast<
+            TessellatorBeginFn
+        >(begin);
+
+    g_tessColor =
+        reinterpret_cast<
+            TessellatorColorFn
+        >(color);
+
+    g_tessVertex =
+        reinterpret_cast<
+            TessellatorVertexFn
+        >(vertex);
+
+    g_renderMesh =
+        reinterpret_cast<
+            RenderMeshFn
+        >(mesh);
+
+    g_getHitResult =
+        reinterpret_cast<
+            GetHitResultFn
+        >(hitResult);
+
+
+    if (
+        !g_renderLevelTarget ||
+        !g_tessBegin ||
+        !g_tessColor ||
+        !g_tessVertex ||
+        !g_renderMesh
+    ) {
+        return;
+    }
+
+
     /*
-     * Do not block ModuleRegistry initialization.
+     * RenderLevelPlayer's selection material path is already
+     * used by Hitbox/Breadcrumbs.
+     *
+     * We resolve its material group lazily when rendering.
      */
-    startWorker();
+
+
+    if (!g_hooked) {
+
+        auto hook =
+            bedrocktools::hooks::install(
+                g_renderLevelTarget,
+                reinterpret_cast<void*>(
+                    renderLevelHook
+                ),
+                reinterpret_cast<void**>(
+                    &g_renderLevelOriginal
+                )
+            );
+
+
+        if (hook) {
+            g_hooked = true;
+        }
+    }
 }
 
 
@@ -1234,75 +854,91 @@ void OutlineRGBModule::onDisable() {
 void OutlineRGBModule::loadConfig(
     const nlohmann::json& j
 ) {
-
     Module::loadConfig(j);
 
+    blockOutline =
+        j.value(
+            "blockOutline",
+            blockOutline
+        );
 
-    if (j.contains("rgbCycle"))
-        rgbCycle =
-            j["rgbCycle"].get<bool>();
+    entityOutline =
+        j.value(
+            "entityOutline",
+            entityOutline
+        );
 
+    outline3D =
+        j.value(
+            "outline3D",
+            outline3D
+        );
 
-    if (j.contains("red"))
-        red =
-            std::clamp(
-                j["red"].get<float>(),
-                0.0f,
-                1.0f
-            );
+    rgbCycle =
+        j.value(
+            "rgbCycle",
+            rgbCycle
+        );
 
+    red =
+        std::clamp(
+            j.value("red", red),
+            0.0f,
+            1.0f
+        );
 
-    if (j.contains("green"))
-        green =
-            std::clamp(
-                j["green"].get<float>(),
-                0.0f,
-                1.0f
-            );
+    green =
+        std::clamp(
+            j.value("green", green),
+            0.0f,
+            1.0f
+        );
 
+    blue =
+        std::clamp(
+            j.value("blue", blue),
+            0.0f,
+            1.0f
+        );
 
-    if (j.contains("blue"))
-        blue =
-            std::clamp(
-                j["blue"].get<float>(),
-                0.0f,
-                1.0f
-            );
+    alpha =
+        std::clamp(
+            j.value("alpha", alpha),
+            0.0f,
+            1.0f
+        );
 
+    chromaSpeed =
+        std::clamp(
+            j.value("chromaSpeed", chromaSpeed),
+            0.05f,
+            1.0f
+        );
 
-    if (j.contains("alpha"))
-        alpha =
-            std::clamp(
-                j["alpha"].get<float>(),
-                0.0f,
-                1.0f
-            );
+    thickness =
+        std::clamp(
+            j.value("thickness", thickness),
+            0.5f,
+            4.0f
+        );
 }
 
 
 void OutlineRGBModule::saveConfig(
     nlohmann::json& j
 ) {
-
     Module::saveConfig(j);
 
+    j["blockOutline"] = blockOutline;
+    j["entityOutline"] = entityOutline;
+    j["outline3D"] = outline3D;
+    j["rgbCycle"] = rgbCycle;
 
-    j["rgbCycle"] =
-        rgbCycle;
+    j["red"] = red;
+    j["green"] = green;
+    j["blue"] = blue;
+    j["alpha"] = alpha;
 
-
-    j["red"] =
-        red;
-
-
-    j["green"] =
-        green;
-
-
-    j["blue"] =
-        blue;
-
-
-    j["alpha"] =
-        alpha;
+    j["chromaSpeed"] = chromaSpeed;
+    j["thickness"] = thickness;
 }
