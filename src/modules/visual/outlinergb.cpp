@@ -1,10 +1,10 @@
 #include "outlinergb.hpp"
 
-#include <bedrocktools/events/EventBus.hpp>
 #include <bedrocktools/memory/Signatures.hpp>
 #include <bedrocktools/sdk/Memory.hpp>
 #include <bedrocktools/sdk/Offsets.hpp>
 #include <bedrocktools/sdk/Types.hpp>
+#include <bedrocktools/sdk/client/ClientInstance.hpp>
 
 #include "core/memory/Hooks.hpp"
 
@@ -35,13 +35,6 @@ using GetHitResultFn =
 
 
 OutlineRGBModule* g_module = nullptr;
-
-/*
- * Captured every tick from LocalPlayerTickEvent, same pattern
- * as HitboxModule. Needed to walk Actor::mLevel -> Level and
- * read the client's current hit result for the block outline.
- */
-void* g_localPlayerPtr = nullptr;
 
 void* g_renderLevelTarget = nullptr;
 
@@ -682,47 +675,70 @@ static void renderLevelHook(
 
 
     /*
-     * Local player pointer is captured every tick via
-     * LocalPlayerTickEvent (see OutlineRGBModule::onInit).
-     * From it we can walk Actor::mLevel to get the Level*
-     * needed for the client-side hit result, same as
-     * HitboxModule does for its selected-entity outline.
+     * Same pattern already used by EntityCullingModule:
+     * ClientInstance::current() -> localPlayer() -> level().
+     * This avoids needing our own actor-tick cache just for
+     * the outline module.
      */
-    if (!g_localPlayerPtr)
+    auto* client =
+        bedrocktools::sdk::ClientInstance::current();
+
+    if (!client)
         return;
 
-    const auto levelPtr =
-        *reinterpret_cast<std::uintptr_t*>(
-            reinterpret_cast<std::uintptr_t>(
-                g_localPlayerPtr
-            ) +
-            bedrocktools::sdk::offsets::
-                Actor::mLevel
-        );
+    auto* localPlayer =
+        client->localPlayer();
 
-    if (!levelPtr)
+    if (!localPlayer)
         return;
 
     void* level =
-        reinterpret_cast<void*>(levelPtr);
+        localPlayer->level();
+
+    if (!level)
+        return;
 
 
-    if (g_module->blockOutline) {
-        bedrocktools::sdk::Vec3 blockPos;
+    if (!g_module->blockOutline) {
+        (void)a3;
+        return;
+    }
 
-        if (getBlockHit(level, blockPos)) {
-            const AABB box =
-                makeBlockBox(blockPos);
 
-            drawThickBox(
-                screenContext,
-                tessellator,
-                box,
-                camX,
-                camY,
-                camZ
-            );
-        }
+    bedrocktools::sdk::Vec3 blockPos{};
+
+    if (!getBlockHit(level, blockPos)) {
+        (void)a3;
+        return;
+    }
+
+
+    const AABB box =
+        makeBlockBox(blockPos);
+
+
+    if (g_module->outline3D) {
+        drawThickBox(
+            screenContext,
+            tessellator,
+            box,
+            camX,
+            camY,
+            camZ
+        );
+    } else {
+        std::vector<Line> lines;
+        lines.reserve(12);
+        addBoxEdges(box, lines);
+
+        drawLines(
+            screenContext,
+            tessellator,
+            lines,
+            camX,
+            camY,
+            camZ
+        );
     }
 
 
@@ -868,20 +884,6 @@ void OutlineRGBModule::onInit() {
             g_hooked = true;
         }
     }
-
-
-    /*
-     * Capture the local player pointer every tick so
-     * renderLevelHook can resolve Level* on demand.
-     * Same pattern as HitboxModule::s_hitboxTickCallback.
-     */
-    bedrocktools::events::bus().subscribe<
-        bedrocktools::events::LocalPlayerTickEvent
-    >(
-        [](auto& event) {
-            g_localPlayerPtr = event.player;
-        }
-    );
 }
 
 
