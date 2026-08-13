@@ -15,16 +15,12 @@ public:
     void loadConfig(const nlohmann::json& j) override;
     void saveConfig(nlohmann::json& j) override;
 
-    bool blockOutline = true;
-    bool entityOutline = true;
-    bool outline3D = true;
     bool rgbCycle = true;
+    bool outline3D = true;
 
-    float red = 1.0f;
-    float green = 0.0f;
-    float blue = 0.0f;
-    float alpha = 1.0f;
+    float colorRed = 1.0f;
+    float colorGreen = 0.0f;
+    float colorBlue = 0.0f;
 
     float chromaSpeed = 1.0f;
-    float thickness = 1.0f;
 };
