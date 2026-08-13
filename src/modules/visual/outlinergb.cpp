@@ -1,5 +1,6 @@
 #include "outlinergb.hpp"
 
+#include <bedrocktools/events/EventBus.hpp>
 #include <bedrocktools/memory/Signatures.hpp>
 #include <bedrocktools/sdk/Memory.hpp>
 #include <bedrocktools/sdk/Offsets.hpp>
@@ -34,6 +35,13 @@ using GetHitResultFn =
 
 
 OutlineRGBModule* g_module = nullptr;
+
+/*
+ * Captured every tick from LocalPlayerTickEvent, same pattern
+ * as HitboxModule. Needed to walk Actor::mLevel -> Level and
+ * read the client's current hit result for the block outline.
+ */
+void* g_localPlayerPtr = nullptr;
 
 void* g_renderLevelTarget = nullptr;
 
@@ -674,28 +682,48 @@ static void renderLevelHook(
 
 
     /*
-     * The local player's Level pointer is used by the
-     * existing SkinStealer/other world modules.
-     *
-     * For the block outline we can get it from the
-     * renderer's player object through the actor pointer
-     * cached by Runtime's tick path.
-     *
-     * Instead of making another per-frame scan over actors,
-     * use the client-side hit result.
+     * Local player pointer is captured every tick via
+     * LocalPlayerTickEvent (see OutlineRGBModule::onInit).
+     * From it we can walk Actor::mLevel to get the Level*
+     * needed for the client-side hit result, same as
+     * HitboxModule does for its selected-entity outline.
      */
-    void* level = nullptr;
-
-
-    /*
-     * The project already stores a current ClientInstance
-     * and exposes it through core::gamehooks.
-     *
-     * We deliberately keep this optional. If unavailable,
-     * the rest of BedrockTools continues normally.
-     */
-    if (!level)
+    if (!g_localPlayerPtr)
         return;
+
+    const auto levelPtr =
+        *reinterpret_cast<std::uintptr_t*>(
+            reinterpret_cast<std::uintptr_t>(
+                g_localPlayerPtr
+            ) +
+            bedrocktools::sdk::offsets::
+                Actor::mLevel
+        );
+
+    if (!levelPtr)
+        return;
+
+    void* level =
+        reinterpret_cast<void*>(levelPtr);
+
+
+    if (g_module->blockOutline) {
+        bedrocktools::sdk::Vec3 blockPos;
+
+        if (getBlockHit(level, blockPos)) {
+            const AABB box =
+                makeBlockBox(blockPos);
+
+            drawThickBox(
+                screenContext,
+                tessellator,
+                box,
+                camX,
+                camY,
+                camZ
+            );
+        }
+    }
 
 
     (void)a3;
@@ -840,6 +868,20 @@ void OutlineRGBModule::onInit() {
             g_hooked = true;
         }
     }
+
+
+    /*
+     * Capture the local player pointer every tick so
+     * renderLevelHook can resolve Level* on demand.
+     * Same pattern as HitboxModule::s_hitboxTickCallback.
+     */
+    bedrocktools::events::bus().subscribe<
+        bedrocktools::events::LocalPlayerTickEvent
+    >(
+        [](auto& event) {
+            g_localPlayerPtr = event.player;
+        }
+    );
 }
 
 
