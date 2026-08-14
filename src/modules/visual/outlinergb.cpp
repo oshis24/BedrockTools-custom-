@@ -1,768 +1,1006 @@
 #include "outlinergb.hpp"
 
-#include <bedrocktools/memory/Signatures.hpp>
-#include <bedrocktools/sdk/Memory.hpp>
-#include <bedrocktools/sdk/Offsets.hpp>
-#include <bedrocktools/sdk/Types.hpp>
-#include <bedrocktools/events/EventBus.hpp>
-
 #include "core/memory/Hooks.hpp"
 
+#include <bedrocktools/memory/Signatures.hpp>
+#include <bedrocktools/sdk/Offsets.hpp>
+#include <bedrocktools/sdk/Types.hpp>
+
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <cstring>
 #include <cstdint>
-#include <string>
-#include <vector>
-#include <utility>
-#include <chrono>
+#include <cstring>
+#include <ctime>
 
 namespace {
 
-using TessellatorBeginFn =
-    void (*)(void*, void*, int, int, int);
+using Tessellator_begin_t =
+    void (*)(void* tessellator,
+             void* debugCallback,
+             int primitiveMode,
+             int vertexCount,
+             int noIndices);
 
-using TessellatorColorFn =
-    void (*)(void*, float, float, float, float);
+using Tessellator_color_t =
+    void (*)(void* tessellator,
+             float r,
+             float g,
+             float b,
+             float a);
 
-using TessellatorVertexFn =
-    void (*)(void*, float, float, float);
+using Tessellator_vertex_t =
+    void (*)(void* tessellator,
+             float x,
+             float y,
+             float z);
 
-using RenderMeshFn =
-    void (*)(void*, void*, void*, char*);
+using MeshHelpers_renderMeshImmediately_t =
+    void (*)(void* screenContext,
+             void* tessellator,
+             void* material,
+             char* pad);
 
+/*
+ * ThickBaddie target ABI.
+ *
+ * The function uses:
+ *   x0 = LevelRenderer-like object
+ *   x1 = ScreenContext
+ *   x4 = BlockPos*
+ *
+ * x5/x6 are preserved as opaque integer arguments.
+ */
+using BlockOutlineRender_t =
+    void (*)(
+        void*,
+        void*,
+        void*,
+        void*,
+        void*,
+        std::uintptr_t,
+        std::uintptr_t
+    );
+
+struct BlockPos {
+    int x;
+    int y;
+    int z;
+};
+
+struct Vec3 {
+    float x;
+    float y;
+    float z;
+};
+
+struct Color {
+    float r;
+    float g;
+    float b;
+    float a;
+};
 
 OutlineRGBModule* g_module = nullptr;
 
-void* g_renderLevelTarget = nullptr;
+BlockOutlineRender_t g_blockOutlineOriginal = nullptr;
 
-TessellatorBeginFn g_tessBegin = nullptr;
-TessellatorColorFn g_tessColor = nullptr;
-TessellatorVertexFn g_tessVertex = nullptr;
-RenderMeshFn g_renderMesh = nullptr;
+Tessellator_begin_t g_tessBegin = nullptr;
+Tessellator_color_t g_tessColor = nullptr;
+Tessellator_vertex_t g_tessVertex = nullptr;
+MeshHelpers_renderMeshImmediately_t g_renderMesh = nullptr;
 
-void (*g_renderLevelOriginal)(
-    void*,
-    void*,
-    void*
-) = nullptr;
+bedrocktools::hooks::Handle g_blockOutlineHook = nullptr;
 
-/*
- * These two are resolved in onInit() below. Previously
- * g_renderMaterialGroup was declared but never assigned
- * anywhere in this file, so ensureMaterial() always bailed
- * out early and the module never drew anything - this is
- * the main reason nothing rendered at all.
- */
-uintptr_t g_renderMaterialGroup = 0;
-void* g_selectionMaterial = nullptr;
-
-bool g_hooked = false;
-
-void* g_localPlayerPtr = nullptr;
-
-float g_hue = 0.0f;
-std::chrono::steady_clock::time_point g_lastTime =
-    std::chrono::steady_clock::now();
-
-
-struct Line {
-    bedrocktools::sdk::Vec3 a;
-    bedrocktools::sdk::Vec3 b;
-};
-
-
-struct AABB {
-    bedrocktools::sdk::Vec3 min;
-    bedrocktools::sdk::Vec3 max;
-};
+bool g_initialized = false;
 
 
 /*
- * Same ADRP/ADD (and literal LDR) resolver already used by
- * HitboxModule to turn a resolved function signature into the
- * actual RenderMaterialGroup pointer it loads.
+ * Monotonic-ish animation clock.
  */
-static uintptr_t resolveADRP(uint32_t* insns, size_t count, uint32_t targetReg) {
-    for (size_t i = 0; i < count; i++) {
-        uint32_t insn = insns[i];
-        if ((insn & 0x1F) != targetReg) continue;
+static double monotonicSeconds() {
+    timespec ts{};
 
-        if ((insn & 0x9F000000) == 0x90000000) {
-            uintptr_t page = ((uintptr_t)&insns[i] & ~0xFFFULL)
-                           + ((int64_t)((uint64_t)((insn >> 3) & 0x1FFFFC | (insn >> 29) & 3) << 43) >> 31);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0.0;
 
-            for (size_t j = i + 1; j < count; j++) {
-                uint32_t add = insns[j];
-                if ((add & 0xFF000000) == 0x91000000 &&
-                    ((add >> 5) & 0x1F) == targetReg &&
-                    (add & 0x1F) == targetReg) {
-                    uint32_t imm12 = (add >> 10) & 0xFFF;
-                    if (add & 0x400000) imm12 <<= 12;
-                    return page + imm12;
-                }
-                if ((add & 0x1F) == targetReg) break;
-            }
-        }
-        if ((insn & 0x9F000000) == 0x10000000) {
-            int64_t imm = (int64_t)((uint64_t)((insn >> 3) & 0x1FFFFC | (insn >> 29)) << 43) >> 43;
-            return (uintptr_t)&insns[i] + imm;
-        }
-    }
-    return 0;
+    return static_cast<double>(ts.tv_sec) +
+           static_cast<double>(ts.tv_nsec) * 1.0e-9;
 }
 
 
-static float clamp01(float value) {
-    return std::clamp(value, 0.0f, 1.0f);
-}
-
-
-static void hsvToRgb(
+/*
+ * HSV -> RGB.
+ *
+ * This gives the continuous UnViableTweaks-style RGB cycle:
+ *
+ * red -> orange -> yellow -> green -> cyan ->
+ * blue -> purple -> red
+ */
+static Color hsvToRgb(
     float h,
     float s,
     float v,
-    float& r,
-    float& g,
-    float& b
+    float a
 ) {
-    h = std::fmod(h, 1.0f);
+    h = h - std::floor(h);
 
-    if (h < 0.0f)
-        h += 1.0f;
+    const float scaled = h * 6.0f;
 
-    const float x = h * 6.0f;
-    const int i = static_cast<int>(std::floor(x));
-    const float f = x - static_cast<float>(i);
+    const int sector =
+        static_cast<int>(std::floor(scaled));
 
-    const float p = v * (1.0f - s);
-    const float q = v * (1.0f - s * f);
-    const float t = v * (1.0f - s * (1.0f - f));
+    const float fraction =
+        scaled - static_cast<float>(sector);
 
-    switch (i % 6) {
+    const float p =
+        v * (1.0f - s);
+
+    const float q =
+        v * (1.0f - s * fraction);
+
+    const float t =
+        v * (1.0f - s * (1.0f - fraction));
+
+    switch (sector % 6) {
         case 0:
-            r = v; g = t; b = p;
-            break;
+            return {v, t, p, a};
 
         case 1:
-            r = q; g = v; b = p;
-            break;
+            return {q, v, p, a};
 
         case 2:
-            r = p; g = v; b = t;
-            break;
+            return {p, v, t, a};
 
         case 3:
-            r = p; g = q; b = v;
-            break;
+            return {p, q, v, a};
 
         case 4:
-            r = t; g = p; b = v;
-            break;
+            return {t, p, v, a};
 
         default:
-            r = v; g = p; b = q;
-            break;
+            return {v, p, q, a};
     }
 }
 
 
-static void updateChroma() {
-    const auto now =
-        std::chrono::steady_clock::now();
-
-    const float dt =
-        std::chrono::duration<float>(
-            now - g_lastTime
-        ).count();
-
-    g_lastTime = now;
-
-    if (!g_module || !g_module->rgbCycle)
-        return;
-
-    g_hue +=
-        dt *
-        0.25f *
-        std::max(
-            0.05f,
-            g_module->chromaSpeed
-        );
-
-    if (g_hue >= 1.0f)
-        g_hue -= std::floor(g_hue);
-}
-
-
-static void getColor(
-    float& r,
-    float& g,
-    float& b,
-    float& a
-) {
-    a = 1.0f;
-
+static Color getOutlineColor() {
     if (!g_module) {
-        r = g = b = 1.0f;
-        return;
+        return {
+            1.0f,
+            1.0f,
+            1.0f,
+            1.0f
+        };
     }
 
-    if (g_module->rgbCycle) {
-        hsvToRgb(
-            g_hue,
-            1.0f,
-            1.0f,
-            r,
-            g,
-            b
+    const float alpha =
+        std::clamp(
+            g_module->alpha,
+            0.0f,
+            1.0f
         );
-        return;
+
+    if (!g_module->rgbCycle) {
+        return {
+            std::clamp(
+                g_module->red,
+                0.0f,
+                1.0f
+            ),
+
+            std::clamp(
+                g_module->green,
+                0.0f,
+                1.0f
+            ),
+
+            std::clamp(
+                g_module->blue,
+                0.0f,
+                1.0f
+            ),
+
+            alpha
+        };
     }
 
-    r = clamp01(g_module->colorRed);
-    g = clamp01(g_module->colorGreen);
-    b = clamp01(g_module->colorBlue);
-}
+    const float speed =
+        std::max(
+            0.01f,
+            g_module->rgbSpeed
+        );
 
+    const float hue =
+        static_cast<float>(
+            std::fmod(
+                monotonicSeconds() *
+                    speed *
+                    0.25,
+                1.0
+            )
+        );
 
-static void addBoxEdges(
-    const AABB& box,
-    std::vector<Line>& lines
-) {
-    const auto& mn = box.min;
-    const auto& mx = box.max;
-
-    const bedrocktools::sdk::Vec3 p000{ mn.x, mn.y, mn.z };
-    const bedrocktools::sdk::Vec3 p100{ mx.x, mn.y, mn.z };
-    const bedrocktools::sdk::Vec3 p110{ mx.x, mx.y, mn.z };
-    const bedrocktools::sdk::Vec3 p010{ mn.x, mx.y, mn.z };
-    const bedrocktools::sdk::Vec3 p001{ mn.x, mn.y, mx.z };
-    const bedrocktools::sdk::Vec3 p101{ mx.x, mn.y, mx.z };
-    const bedrocktools::sdk::Vec3 p111{ mx.x, mx.y, mx.z };
-    const bedrocktools::sdk::Vec3 p011{ mn.x, mx.y, mx.z };
-
-    lines.push_back({p000, p100});
-    lines.push_back({p100, p110});
-    lines.push_back({p110, p010});
-    lines.push_back({p010, p000});
-
-    lines.push_back({p001, p101});
-    lines.push_back({p101, p111});
-    lines.push_back({p111, p011});
-    lines.push_back({p011, p001});
-
-    lines.push_back({p000, p001});
-    lines.push_back({p100, p101});
-    lines.push_back({p110, p111});
-    lines.push_back({p010, p011});
-}
-
-
-static AABB makeBlockBox(
-    const bedrocktools::sdk::Vec3& pos
-) {
-    return {
-        {
-            std::floor(pos.x),
-            std::floor(pos.y),
-            std::floor(pos.z)
-        },
-        {
-            std::floor(pos.x) + 1.0f,
-            std::floor(pos.y) + 1.0f,
-            std::floor(pos.z) + 1.0f
-        }
-    };
+    return hsvToRgb(
+        hue,
+        1.0f,
+        1.0f,
+        alpha
+    );
 }
 
 
 /*
- * Local player pointer captured every tick, exactly the same
- * mechanism ReachCounter/SkinStealer/Hitbox already use
- * successfully in this project - LocalPlayerTickEvent, not
- * ClientInstance::current().
+ * Emit one vertex.
  */
-static void onLocalPlayerTick(void* player) {
-    if (!g_module || !g_module->enabled)
-        return;
-
-    g_localPlayerPtr = player;
+static inline void vertex(
+    void* tessellator,
+    const Vec3& p
+) {
+    g_tessVertex(
+        tessellator,
+        p.x,
+        p.y,
+        p.z
+    );
 }
 
 
 /*
- * Direct offset chain instead of calling a separately-resolved
- * "LevelGetHitResult" function pointer - matches Hitbox's proven
- * working path: Actor::mLevel -> Level::mHitResultWrapper ->
- * HitResultWrapper::mHitResult.
+ * Draw one face as four line segments.
+ *
+ * ThickBaddie uses primitive mode 1 with 8 vertices
+ * for its outline rendering path.
  */
-static bool getBlockHit(bedrocktools::sdk::Vec3& blockPos) {
-    if (!g_localPlayerPtr)
-        return false;
-
-    const uintptr_t levelPtr =
-        *reinterpret_cast<uintptr_t*>(
-            reinterpret_cast<uintptr_t>(g_localPlayerPtr) +
-            bedrocktools::sdk::offsets::Actor::mLevel
-        );
-
-    if (!levelPtr)
-        return false;
-
-    const uintptr_t hitResult =
-        levelPtr +
-        bedrocktools::sdk::offsets::Level::mHitResultWrapper +
-        bedrocktools::sdk::offsets::HitResultWrapper::mHitResult;
-
-    const int type =
-        *reinterpret_cast<int*>(
-            hitResult +
-            bedrocktools::sdk::offsets::HitResult::mType
-        );
-
-    if (type != 0 && type != 1)
-        return false;
-
-    const auto* pos =
-        reinterpret_cast<const bedrocktools::sdk::Vec3*>(
-            hitResult +
-            bedrocktools::sdk::offsets::HitResult::mPos
-        );
-
-    blockPos = *pos;
-    return true;
-}
-
-
-static void ensureMaterial() {
-    if (g_selectionMaterial)
-        return;
-
-    if (!g_renderMaterialGroup)
-        return;
-
-    struct HashedString {
-        std::uint64_t hash;
-        std::string string;
-        const void* lastMatch;
-    };
-
-    HashedString hs{
-        0xcbf29ce484222325ULL,
-        "selection_box",
-        nullptr
-    };
-
-    for (char c : hs.string) {
-        hs.hash =
-            static_cast<std::uint64_t>(
-                static_cast<unsigned char>(c)
-            ) ^
-            (
-                hs.hash *
-                0x100000001b3ULL
-            );
-    }
-
-    void** vtable =
-        *reinterpret_cast<void***>(
-            g_renderMaterialGroup
-        );
-
-    if (!vtable || !vtable[2])
-        return;
-
-    using GetMaterialFn =
-        void* (*)(void*, const HashedString*);
-
-    auto getMaterial =
-        reinterpret_cast<GetMaterialFn>(
-            vtable[2]
-        );
-
-    g_selectionMaterial =
-        getMaterial(
-            reinterpret_cast<void*>(g_renderMaterialGroup),
-            &hs
-        );
-}
-
-
-static void drawLines(
+static void drawFace(
     void* screenContext,
     void* tessellator,
     void* material,
-    std::vector<Line>& lines,
+    const std::array<Vec3, 4>& face,
+    const Color& color,
     float camX,
     float camY,
     float camZ
 ) {
-    if (
-        lines.empty() ||
-        !g_tessBegin ||
+    if (!g_tessBegin ||
         !g_tessColor ||
         !g_tessVertex ||
-        !g_renderMesh ||
-        !material
-    ) {
+        !g_renderMesh) {
         return;
     }
-
-
-    float r, g, b, a;
-    getColor(r, g, b, a);
-
 
     g_tessBegin(
         tessellator,
         nullptr,
-        4,
-        static_cast<int>(
-            lines.size() * 2
-        ),
+        1,
+        8,
         0
     );
 
     g_tessColor(
         tessellator,
-        r,
-        g,
-        b,
-        a
+        color.r,
+        color.g,
+        color.b,
+        color.a
     );
 
+    for (int i = 0; i < 4; ++i) {
+        const Vec3& a =
+            face[i];
 
-    for (const auto& line : lines) {
+        const Vec3& b =
+            face[(i + 1) & 3];
 
-        float ax = line.a.x - camX;
-        float ay = line.a.y - camY;
-        float az = line.a.z - camZ;
+        vertex(
+            tessellator,
+            a.x - camX,
+            a.y - camY,
+            a.z - camZ
+        );
 
-        float bx = line.b.x - camX;
-        float by = line.b.y - camY;
-        float bz = line.b.z - camZ;
-
-        g_tessVertex(tessellator, ax, ay, az);
-        g_tessVertex(tessellator, bx, by, bz);
+        vertex(
+            tessellator,
+            b.x - camX,
+            b.y - camY,
+            b.z - camZ
+        );
     }
 
-
-    char padding[0x58];
-    std::memset(padding, 0, sizeof(padding));
+    /*
+     * BedrockTools' existing rendering modules use this
+     * 0x58-byte render-mesh argument block.
+     */
+    char pad[0x58]{};
 
     g_renderMesh(
         screenContext,
         tessellator,
         material,
-        padding
+        pad
     );
 }
 
 
 /*
- * Fixed, no longer user-configurable (thickness slider was
- * removed from the menu per request) - 2 layers gives a subtle
- * but clearly visible thickness without a GL line-width
- * dependency, same geometric-expansion idea ThickBaddieOutline
- * uses.
+ * Draw a complete block outline.
+ *
+ * We use multiple parallel copies of the edge geometry
+ * to emulate thickness. This avoids GLES glLineWidth,
+ * which is unreliable on Android/Mali.
  */
-static void drawThickBox(
+static void drawBlockOutline(
     void* screenContext,
     void* tessellator,
     void* material,
-    const AABB& box,
+    const BlockPos& block,
     float camX,
     float camY,
-    float camZ
+    float camZ,
+    const Color& color,
+    int thickness
 ) {
-    constexpr int kLayers = 2;
-    constexpr float kStep = 0.0025f;
-
-    std::vector<Line> lines;
-    lines.reserve(kLayers * 12);
-
-    for (int i = 0; i < kLayers; ++i) {
-        const float expand = kStep * static_cast<float>(i);
-
-        AABB layer{
-            {
-                box.min.x - expand,
-                box.min.y - expand,
-                box.min.z - expand
-            },
-            {
-                box.max.x + expand,
-                box.max.y + expand,
-                box.max.z + expand
-            }
-        };
-
-        addBoxEdges(layer, lines);
+    if (!screenContext ||
+        !tessellator ||
+        !material) {
+        return;
     }
 
-    drawLines(
+    thickness =
+        std::clamp(
+            thickness,
+            1,
+            5
+        );
+
+    /*
+     * The native block outline is based on a one-block
+     * bounding box.
+     */
+    const float minX =
+        static_cast<float>(block.x);
+
+    const float minY =
+        static_cast<float>(block.y);
+
+    const float minZ =
+        static_cast<float>(block.z);
+
+    const float maxX =
+        minX + 1.0f;
+
+    const float maxY =
+        minY + 1.0f;
+
+    const float maxZ =
+        minZ + 1.0f;
+
+    /*
+     * Spacing between parallel outline lines.
+     *
+     * This is deliberately small because coordinates are
+     * Minecraft world units, not screen pixels.
+     */
+    const float spacing =
+        0.006f *
+        static_cast<float>(
+            thickness
+        );
+
+    /*
+     * We render several slightly offset copies.
+     *
+     * This gives an actual visual thickness even on GPUs
+     * that clamp GL line width to 1.
+     */
+    for (int layer = 0;
+         layer < thickness;
+         ++layer) {
+
+        const float center =
+            static_cast<float>(
+                layer
+            ) -
+            static_cast<float>(
+                thickness - 1
+            ) * 0.5f;
+
+        const float o =
+            center * spacing;
+
+        /*
+         * XY bottom.
+         */
+        drawFace(
+            screenContext,
+            tessellator,
+            material,
+            {
+                Vec3{minX, minY + o, minZ + o},
+                Vec3{maxX, minY + o, minZ + o},
+                Vec3{maxX, minY + o, maxZ},
+                Vec3{minX, minY + o, maxZ}
+            },
+            color,
+            camX,
+            camY,
+            camZ
+        );
+
+        /*
+         * XY top.
+         */
+        drawFace(
+            screenContext,
+            tessellator,
+            material,
+            {
+                Vec3{minX, maxY + o, minZ + o},
+                Vec3{maxX, maxY + o, minZ + o},
+                Vec3{maxX, maxY + o, maxZ},
+                Vec3{minX, maxY + o, maxZ}
+            },
+            color,
+            camX,
+            camY,
+            camZ
+        );
+
+        /*
+         * XZ front.
+         */
+        drawFace(
+            screenContext,
+            tessellator,
+            material,
+            {
+                Vec3{minX, minY + o, minZ},
+                Vec3{maxX, minY + o, minZ},
+                Vec3{maxX, maxY + o, minZ},
+                Vec3{minX, maxY + o, minZ}
+            },
+            color,
+            camX,
+            camY,
+            camZ
+        );
+
+        /*
+         * XZ back.
+         */
+        drawFace(
+            screenContext,
+            tessellator,
+            material,
+            {
+                Vec3{minX, minY + o, maxZ},
+                Vec3{maxX, minY + o, maxZ},
+                Vec3{maxX, maxY + o, maxZ},
+                Vec3{minX, maxY + o, maxZ}
+            },
+            color,
+            camX,
+            camY,
+            camZ
+        );
+
+        /*
+         * YZ left.
+         */
+        drawFace(
+            screenContext,
+            tessellator,
+            material,
+            {
+                Vec3{minX + o, minY, minZ},
+                Vec3{minX + o, minY, maxZ},
+                Vec3{minX + o, maxY, maxZ},
+                Vec3{minX + o, maxY, minZ}
+            },
+            color,
+            camX,
+            camY,
+            camZ
+        );
+
+        /*
+         * YZ right.
+         */
+        drawFace(
+            screenContext,
+            tessellator,
+            material,
+            {
+                Vec3{maxX + o, minY, minZ},
+                Vec3{maxX + o, minY, maxZ},
+                Vec3{maxX + o, maxY, maxZ},
+                Vec3{maxX + o, maxY, minZ}
+            },
+            color,
+            camX,
+            camY,
+            camZ
+        );
+    }
+}
+
+
+/*
+ * Main replacement for ThickBaddie's first outline target.
+ *
+ * Verified ABI:
+ *
+ * x0 = LevelRenderer-like object
+ * x1 = ScreenContext
+ * x4 = BlockPos*
+ *
+ * The original function is intentionally NOT called while
+ * the module is enabled. ThickBaddie uses the same strategy:
+ * its replacement completely owns the outline rendering path.
+ */
+static void blockOutlineHook(
+    void* levelRenderer,
+    void* screenContext,
+    void* x2,
+    void* x3,
+    void* blockPosPtr,
+    std::uintptr_t x5,
+    std::uintptr_t x6
+) {
+    (void)x2;
+    (void)x3;
+    (void)x5;
+    (void)x6;
+
+    if (!g_module ||
+        !g_module->enabled) {
+
+        if (g_blockOutlineOriginal) {
+            g_blockOutlineOriginal(
+                levelRenderer,
+                screenContext,
+                x2,
+                x3,
+                blockPosPtr,
+                x5,
+                x6
+            );
+        }
+
+        return;
+    }
+
+    /*
+     * Safety checks.
+     */
+    if (!levelRenderer ||
+        reinterpret_cast<std::uintptr_t>(
+            levelRenderer
+        ) < 0x1000 ||
+        !screenContext ||
+        reinterpret_cast<std::uintptr_t>(
+            screenContext
+        ) < 0x1000 ||
+        !blockPosPtr ||
+        reinterpret_cast<std::uintptr_t>(
+            blockPosPtr
+        ) < 0x1000) {
+
+        if (g_blockOutlineOriginal) {
+            g_blockOutlineOriginal(
+                levelRenderer,
+                screenContext,
+                x2,
+                x3,
+                blockPosPtr,
+                x5,
+                x6
+            );
+        }
+
+        return;
+    }
+
+    if (!g_tessBegin ||
+        !g_tessColor ||
+        !g_tessVertex ||
+        !g_renderMesh) {
+
+        if (g_blockOutlineOriginal) {
+            g_blockOutlineOriginal(
+                levelRenderer,
+                screenContext,
+                x2,
+                x3,
+                blockPosPtr,
+                x5,
+                x6
+            );
+        }
+
+        return;
+    }
+
+    const BlockPos block =
+        *reinterpret_cast<const BlockPos*>(
+            blockPosPtr
+        );
+
+    /*
+     * ScreenContext::mTessellator = 0xB8.
+     */
+    const auto screen =
+        reinterpret_cast<std::uintptr_t>(
+            screenContext
+        );
+
+    const auto tessellatorPtr =
+        *reinterpret_cast<std::uintptr_t*>(
+            screen +
+            bedrocktools::sdk::offsets::
+                ScreenContext::mTessellator
+        );
+
+    if (!tessellatorPtr ||
+        tessellatorPtr < 0x1000) {
+
+        if (g_blockOutlineOriginal) {
+            g_blockOutlineOriginal(
+                levelRenderer,
+                screenContext,
+                x2,
+                x3,
+                blockPosPtr,
+                x5,
+                x6
+            );
+        }
+
+        return;
+    }
+
+    void* tessellator =
+        reinterpret_cast<void*>(
+            tessellatorPtr
+        );
+
+    /*
+     * LevelRenderer::mLevelRendererPlayer = 0x420.
+     */
+    const auto renderer =
+        reinterpret_cast<std::uintptr_t>(
+            levelRenderer
+        );
+
+    const auto lrpPtr =
+        *reinterpret_cast<std::uintptr_t*>(
+            renderer +
+            bedrocktools::sdk::offsets::
+                LevelRenderer::mLevelRendererPlayer
+        );
+
+    if (!lrpPtr ||
+        lrpPtr < 0x1000) {
+
+        if (g_blockOutlineOriginal) {
+            g_blockOutlineOriginal(
+                levelRenderer,
+                screenContext,
+                x2,
+                x3,
+                blockPosPtr,
+                x5,
+                x6
+            );
+        }
+
+        return;
+    }
+
+    /*
+     * LevelRendererPlayer::mCamPos = 0x61C.
+     */
+    const auto cam =
+        reinterpret_cast<const float*>(
+            lrpPtr +
+            bedrocktools::sdk::offsets::
+                LevelRendererPlayer::mCamPos
+        );
+
+    const float camX = cam[0];
+    const float camY = cam[1];
+    const float camZ = cam[2];
+
+    /*
+     * Selection overlay material is an embedded material
+     * object at 0x1030, not a pointer that needs to be
+     * dereferenced.
+     */
+    void* material =
+        reinterpret_cast<void*>(
+            lrpPtr +
+            bedrocktools::sdk::offsets::
+                LevelRendererPlayer::
+                    mSelectionOverlayMaterial
+        );
+
+    if (!material) {
+        if (g_blockOutlineOriginal) {
+            g_blockOutlineOriginal(
+                levelRenderer,
+                screenContext,
+                x2,
+                x3,
+                blockPosPtr,
+                x5,
+                x6
+            );
+        }
+
+        return;
+    }
+
+    /*
+     * Bedrock's selection rendering uses the color holder.
+     *
+     * Save it and restore it after our rendering.
+     */
+    const auto colorHolderPtr =
+        *reinterpret_cast<std::uintptr_t*>(
+            screen +
+            bedrocktools::sdk::offsets::
+                ScreenContext::mColorHolder
+        );
+
+    float savedColor[4]{};
+
+    bool restoreColor = false;
+
+    if (colorHolderPtr &&
+        colorHolderPtr >= 0x1000) {
+
+        float* colorHolder =
+            reinterpret_cast<float*>(
+                colorHolderPtr
+            );
+
+        savedColor[0] = colorHolder[0];
+        savedColor[1] = colorHolder[1];
+        savedColor[2] = colorHolder[2];
+        savedColor[3] = colorHolder[3];
+
+        /*
+         * Keep the material neutral. RGB is supplied
+         * directly through TessellatorColor.
+         */
+        colorHolder[0] = 1.0f;
+        colorHolder[1] = 1.0f;
+        colorHolder[2] = 1.0f;
+        colorHolder[3] = 1.0f;
+
+        restoreColor = true;
+    }
+
+    const Color color =
+        getOutlineColor();
+
+    drawBlockOutline(
         screenContext,
         tessellator,
         material,
-        lines,
+        block,
         camX,
         camY,
-        camZ
+        camZ,
+        color,
+        g_module->thickness
     );
+
+    if (restoreColor) {
+        float* colorHolder =
+            reinterpret_cast<float*>(
+                colorHolderPtr
+            );
+
+        colorHolder[0] =
+            savedColor[0];
+
+        colorHolder[1] =
+            savedColor[1];
+
+        colorHolder[2] =
+            savedColor[2];
+
+        colorHolder[3] =
+            savedColor[3];
+    }
 }
-
-
-static void renderLevelHook(
-    void* self,
-    void* screenContext,
-    void* a3
-) {
-    if (g_renderLevelOriginal) {
-        g_renderLevelOriginal(self, screenContext, a3);
-    }
-
-    if (!g_module || !g_module->enabled)
-        return;
-
-    if (!screenContext || !self)
-        return;
-
-    if (
-        !g_tessBegin ||
-        !g_tessColor ||
-        !g_tessVertex ||
-        !g_renderMesh
-    ) {
-        return;
-    }
-
-
-    const auto screen =
-        reinterpret_cast<std::uintptr_t>(screenContext);
-
-    void* tessellator =
-        *reinterpret_cast<void**>(
-            screen +
-            bedrocktools::sdk::offsets::ScreenContext::mTessellator
-        );
-
-    if (!tessellator)
-        return;
-
-
-    const auto renderer =
-        reinterpret_cast<std::uintptr_t>(self);
-
-    void* levelRendererPlayer =
-        *reinterpret_cast<void**>(
-            renderer +
-            bedrocktools::sdk::offsets::LevelRenderer::mLevelRendererPlayer
-        );
-
-    if (!levelRendererPlayer)
-        return;
-
-    const auto lrp =
-        reinterpret_cast<std::uintptr_t>(levelRendererPlayer);
-
-    const float camX =
-        *reinterpret_cast<float*>(
-            lrp + bedrocktools::sdk::offsets::LevelRendererPlayer::mCamPos
-        );
-
-    const float camY =
-        *reinterpret_cast<float*>(
-            lrp + bedrocktools::sdk::offsets::LevelRendererPlayer::mCamPos + 4
-        );
-
-    const float camZ =
-        *reinterpret_cast<float*>(
-            lrp + bedrocktools::sdk::offsets::LevelRendererPlayer::mCamPos + 8
-        );
-
-
-    ensureMaterial();
-
-    /*
-     * Same fallback Hitbox uses: if the material-group vtable
-     * lookup didn't resolve, fall back to the material pointer
-     * already cached on LevelRendererPlayer.
-     */
-    void* material =
-        g_selectionMaterial
-            ? g_selectionMaterial
-            : reinterpret_cast<void*>(
-                  lrp +
-                  bedrocktools::sdk::offsets::LevelRendererPlayer::mSelectionOverlayMaterial
-              );
-
-    if (!material)
-        return;
-
-
-    updateChroma();
-
-
-    bedrocktools::sdk::Vec3 blockPos{};
-
-    if (!getBlockHit(blockPos))
-        return;
-
-    const AABB box = makeBlockBox(blockPos);
-
-
-    if (g_module->outline3D) {
-        drawThickBox(
-            screenContext,
-            tessellator,
-            material,
-            box,
-            camX,
-            camY,
-            camZ
-        );
-    } else {
-        std::vector<Line> lines;
-        lines.reserve(12);
-        addBoxEdges(box, lines);
-
-        drawLines(
-            screenContext,
-            tessellator,
-            material,
-            lines,
-            camX,
-            camY,
-            camZ
-        );
-    }
-
-
-    (void)a3;
-}
-
 
 } // namespace
+
+
+OutlineRGBModule*
+    OutlineRGBModule::instance = nullptr;
 
 
 OutlineRGBModule::OutlineRGBModule()
     : Module(
         "Outline RGB",
-        "RGB block outline with optional 3D AABB rendering."
+        "RGB 3D block outline with adjustable visual thickness."
     ) {
+    showInMenu = true;
+
+    instance = this;
     g_module = this;
 }
 
 
 OutlineRGBModule::~OutlineRGBModule() {
+    if (instance == this)
+        instance = nullptr;
+
     if (g_module == this)
         g_module = nullptr;
 }
 
 
 void OutlineRGBModule::onInit() {
-
-    const auto renderLevel =
-        bedrocktools::memory::resolve(
-            bedrocktools::memory::SignatureId::RenderLevel
-        );
-
-    if (renderLevel) {
-        g_renderLevelTarget = reinterpret_cast<void*>(renderLevel);
-    }
-
-
-    const auto begin =
-        bedrocktools::memory::resolve(
-            bedrocktools::memory::SignatureId::TessellatorBegin
-        );
-
-    const auto color =
-        bedrocktools::memory::resolve(
-            bedrocktools::memory::SignatureId::TessellatorColor
-        );
-
-    const auto vertex =
-        bedrocktools::memory::resolve(
-            bedrocktools::memory::SignatureId::TessellatorVertex
-        );
-
-    auto mesh =
-        bedrocktools::memory::resolve(
-            bedrocktools::memory::SignatureId::MeshHelpersRenderMeshImmediately2
-        );
-
-    if (!mesh) {
-        mesh =
-            bedrocktools::memory::resolve(
-                bedrocktools::memory::SignatureId::MeshHelpersRenderMeshImmediately
-            );
-    }
-
-    g_tessBegin = reinterpret_cast<TessellatorBeginFn>(begin);
-    g_tessColor = reinterpret_cast<TessellatorColorFn>(color);
-    g_tessVertex = reinterpret_cast<TessellatorVertexFn>(vertex);
-    g_renderMesh = reinterpret_cast<RenderMeshFn>(mesh);
-
-
-    /*
-     * This is the piece that was completely missing before:
-     * g_renderMaterialGroup was never assigned, so the module
-     * silently drew nothing every single frame.
-     */
-    const auto rmg =
-        bedrocktools::memory::resolve(
-            bedrocktools::memory::SignatureId::RenderMaterialGroupCommon
-        );
-
-    if (rmg) {
-        const auto groupAddr =
-            resolveADRP(reinterpret_cast<uint32_t*>(rmg), 8, 0);
-
-        if (groupAddr) {
-            g_renderMaterialGroup =
-                groupAddr +
-                bedrocktools::sdk::offsets::MaterialGroup::mRenderMaterialGroupOffset;
-        }
-    }
-
-
-    if (
-        !g_renderLevelTarget ||
-        !g_tessBegin ||
-        !g_tessColor ||
-        !g_tessVertex ||
-        !g_renderMesh
-    ) {
+    if (g_initialized)
         return;
-    }
 
+    const auto target =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                BlockOutlineRender
+        );
 
-    bedrocktools::events::bus().subscribe<bedrocktools::events::LocalPlayerTickEvent>(
-        [](auto& event) { onLocalPlayerTick(event.player); }
-    );
+    if (!target)
+        return;
 
+    m_patchTarget =
+        reinterpret_cast<void*>(
+            target
+        );
 
-    if (!g_hooked) {
-        auto hook =
-            bedrocktools::hooks::install(
-                g_renderLevelTarget,
-                reinterpret_cast<void*>(renderLevelHook),
-                reinterpret_cast<void**>(&g_renderLevelOriginal)
+    g_tessBegin =
+        reinterpret_cast<Tessellator_begin_t>(
+            bedrocktools::memory::resolve(
+                bedrocktools::memory::SignatureId::
+                    TessellatorBegin
+            )
+        );
+
+    g_tessColor =
+        reinterpret_cast<Tessellator_color_t>(
+            bedrocktools::memory::resolve(
+                bedrocktools::memory::SignatureId::
+                    TessellatorColor
+            )
+        );
+
+    g_tessVertex =
+        reinterpret_cast<Tessellator_vertex_t>(
+            bedrocktools::memory::resolve(
+                bedrocktools::memory::SignatureId::
+                    TessellatorVertex
+            )
+        );
+
+    auto renderMesh =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                MeshHelpersRenderMeshImmediately2
+        );
+
+    if (!renderMesh) {
+        renderMesh =
+            bedrocktools::memory::resolve(
+                bedrocktools::memory::SignatureId::
+                    MeshHelpersRenderMeshImmediately
             );
-
-        if (hook) {
-            g_hooked = true;
-        }
     }
+
+    g_renderMesh =
+        reinterpret_cast<
+            MeshHelpers_renderMeshImmediately_t
+        >(renderMesh);
+
+    g_initialized =
+        m_patchTarget != nullptr &&
+        g_tessBegin != nullptr &&
+        g_tessColor != nullptr &&
+        g_tessVertex != nullptr &&
+        g_renderMesh != nullptr;
+}
+
+
+bool OutlineRGBModule::installHooks() {
+    if (m_patched)
+        return true;
+
+    if (!m_patchTarget)
+        return false;
+
+    if (!g_initialized)
+        return false;
+
+    g_blockOutlineHook =
+        bedrocktools::hooks::install(
+            m_patchTarget,
+            reinterpret_cast<void*>(
+                blockOutlineHook
+            ),
+            reinterpret_cast<void**>(
+                &g_blockOutlineOriginal
+            )
+        );
+
+    if (!g_blockOutlineHook)
+        return false;
+
+    m_patched = true;
+
+    return true;
 }
 
 
 void OutlineRGBModule::onEnable() {
+    installHooks();
 }
 
 
 void OutlineRGBModule::onDisable() {
+    /*
+     * Hook stays installed.
+     *
+     * blockOutlineHook transparently calls the native
+     * function while disabled.
+     */
+}
+
+
+void OutlineRGBModule::onFrame() {
+    rgbSpeed =
+        std::clamp(
+            rgbSpeed,
+            0.01f,
+            5.0f
+        );
+
+    alpha =
+        std::clamp(
+            alpha,
+            0.0f,
+            1.0f
+        );
+
+    red =
+        std::clamp(
+            red,
+            0.0f,
+            1.0f
+        );
+
+    green =
+        std::clamp(
+            green,
+            0.0f,
+            1.0f
+        );
+
+    blue =
+        std::clamp(
+            blue,
+            0.0f,
+            1.0f
+        );
+
+    thickness =
+        std::clamp(
+            thickness,
+            1,
+            5
+        );
 }
 
 
@@ -771,20 +1009,89 @@ void OutlineRGBModule::loadConfig(
 ) {
     Module::loadConfig(j);
 
-    rgbCycle = j.value("rgbCycle", rgbCycle);
-    outline3D = j.value("outline3D", outline3D);
+    rgbCycle =
+        j.value(
+            "rgbCycle",
+            rgbCycle
+        );
 
-    colorRed =
-        std::clamp(j.value("colorRed", colorRed), 0.0f, 1.0f);
+    red =
+        j.value(
+            "red",
+            red
+        );
 
-    colorGreen =
-        std::clamp(j.value("colorGreen", colorGreen), 0.0f, 1.0f);
+    green =
+        j.value(
+            "green",
+            green
+        );
 
-    colorBlue =
-        std::clamp(j.value("colorBlue", colorBlue), 0.0f, 1.0f);
+    blue =
+        j.value(
+            "blue",
+            blue
+        );
 
-    chromaSpeed =
-        std::clamp(j.value("chromaSpeed", chromaSpeed), 0.05f, 1.0f);
+    alpha =
+        j.value(
+            "alpha",
+            alpha
+        );
+
+    rgbSpeed =
+        j.value(
+            "rgbSpeed",
+            rgbSpeed
+        );
+
+    thickness =
+        j.value(
+            "thickness",
+            thickness
+        );
+
+    red =
+        std::clamp(
+            red,
+            0.0f,
+            1.0f
+        );
+
+    green =
+        std::clamp(
+            green,
+            0.0f,
+            1.0f
+        );
+
+    blue =
+        std::clamp(
+            blue,
+            0.0f,
+            1.0f
+        );
+
+    alpha =
+        std::clamp(
+            alpha,
+            0.0f,
+            1.0f
+        );
+
+    rgbSpeed =
+        std::clamp(
+            rgbSpeed,
+            0.01f,
+            5.0f
+        );
+
+    thickness =
+        std::clamp(
+            thickness,
+            1,
+            5
+        );
 }
 
 
@@ -793,12 +1100,24 @@ void OutlineRGBModule::saveConfig(
 ) {
     Module::saveConfig(j);
 
-    j["rgbCycle"] = rgbCycle;
-    j["outline3D"] = outline3D;
+    j["rgbCycle"] =
+        rgbCycle;
 
-    j["colorRed"] = colorRed;
-    j["colorGreen"] = colorGreen;
-    j["colorBlue"] = colorBlue;
+    j["red"] =
+        red;
 
-    j["chromaSpeed"] = chromaSpeed;
+    j["green"] =
+        green;
+
+    j["blue"] =
+        blue;
+
+    j["alpha"] =
+        alpha;
+
+    j["rgbSpeed"] =
+        rgbSpeed;
+
+    j["thickness"] =
+        thickness;
 }
