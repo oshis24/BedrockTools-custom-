@@ -10,7 +10,6 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <ctime>
 
 namespace {
@@ -41,16 +40,6 @@ using MeshHelpers_renderMeshImmediately_t =
              void* material,
              char* pad);
 
-/*
- * ThickBaddie target ABI.
- *
- * The function uses:
- *   x0 = LevelRenderer-like object
- *   x1 = ScreenContext
- *   x4 = BlockPos*
- *
- * x5/x6 are preserved as opaque integer arguments.
- */
 using BlockOutlineRender_t =
     void (*)(
         void*,
@@ -88,6 +77,7 @@ BlockOutlineRender_t g_blockOutlineOriginal = nullptr;
 Tessellator_begin_t g_tessBegin = nullptr;
 Tessellator_color_t g_tessColor = nullptr;
 Tessellator_vertex_t g_tessVertex = nullptr;
+
 MeshHelpers_renderMeshImmediately_t g_renderMesh = nullptr;
 
 bedrocktools::hooks::Handle g_blockOutlineHook = nullptr;
@@ -95,9 +85,6 @@ bedrocktools::hooks::Handle g_blockOutlineHook = nullptr;
 bool g_initialized = false;
 
 
-/*
- * Monotonic-ish animation clock.
- */
 static double monotonicSeconds() {
     timespec ts{};
 
@@ -109,14 +96,6 @@ static double monotonicSeconds() {
 }
 
 
-/*
- * HSV -> RGB.
- *
- * This gives the continuous UnViableTweaks-style RGB cycle:
- *
- * red -> orange -> yellow -> green -> cyan ->
- * blue -> purple -> red
- */
 static Color hsvToRgb(
     float h,
     float s,
@@ -128,10 +107,13 @@ static Color hsvToRgb(
     const float scaled = h * 6.0f;
 
     const int sector =
-        static_cast<int>(std::floor(scaled));
+        static_cast<int>(
+            std::floor(scaled)
+        );
 
     const float fraction =
-        scaled - static_cast<float>(sector);
+        scaled -
+        static_cast<float>(sector);
 
     const float p =
         v * (1.0f - s);
@@ -230,13 +212,13 @@ static Color getOutlineColor() {
 }
 
 
-/*
- * Emit one vertex.
- */
 static inline void vertex(
     void* tessellator,
     const Vec3& p
 ) {
+    if (!g_tessVertex)
+        return;
+
     g_tessVertex(
         tessellator,
         p.x,
@@ -246,12 +228,6 @@ static inline void vertex(
 }
 
 
-/*
- * Draw one face as four line segments.
- *
- * ThickBaddie uses primitive mode 1 with 8 vertices
- * for its outline rendering path.
- */
 static void drawFace(
     void* screenContext,
     void* tessellator,
@@ -269,6 +245,11 @@ static void drawFace(
         return;
     }
 
+    /*
+     * Primitive mode 1 = line list.
+     *
+     * 4 edges × 2 vertices = 8 vertices.
+     */
     g_tessBegin(
         tessellator,
         nullptr,
@@ -292,24 +273,36 @@ static void drawFace(
         const Vec3& b =
             face[(i + 1) & 3];
 
-        vertex(
-            tessellator,
+        /*
+         * Convert world coordinates into camera-relative
+         * coordinates.
+         */
+        const Vec3 aRelative{
             a.x - camX,
             a.y - camY,
             a.z - camZ
+        };
+
+        const Vec3 bRelative{
+            b.x - camX,
+            b.y - camY,
+            b.z - camZ
+        };
+
+        vertex(
+            tessellator,
+            aRelative
         );
 
         vertex(
             tessellator,
-            b.x - camX,
-            b.y - camY,
-            b.z - camZ
+            bRelative
         );
     }
 
     /*
-     * BedrockTools' existing rendering modules use this
-     * 0x58-byte render-mesh argument block.
+     * Existing BedrockTools rendering code uses the
+     * immediate RenderMesh path.
      */
     char pad[0x58]{};
 
@@ -322,13 +315,6 @@ static void drawFace(
 }
 
 
-/*
- * Draw a complete block outline.
- *
- * We use multiple parallel copies of the edge geometry
- * to emulate thickness. This avoids GLES glLineWidth,
- * which is unreliable on Android/Mali.
- */
 static void drawBlockOutline(
     void* screenContext,
     void* tessellator,
@@ -353,10 +339,6 @@ static void drawBlockOutline(
             5
         );
 
-    /*
-     * The native block outline is based on a one-block
-     * bounding box.
-     */
     const float minX =
         static_cast<float>(block.x);
 
@@ -376,31 +358,21 @@ static void drawBlockOutline(
         minZ + 1.0f;
 
     /*
-     * Spacing between parallel outline lines.
+     * Small geometry offset used to simulate line thickness.
      *
-     * This is deliberately small because coordinates are
-     * Minecraft world units, not screen pixels.
+     * We intentionally do not use glLineWidth because
+     * Android/Mali implementations commonly clamp it.
      */
     const float spacing =
         0.006f *
-        static_cast<float>(
-            thickness
-        );
+        static_cast<float>(thickness);
 
-    /*
-     * We render several slightly offset copies.
-     *
-     * This gives an actual visual thickness even on GPUs
-     * that clamp GL line width to 1.
-     */
     for (int layer = 0;
          layer < thickness;
          ++layer) {
 
         const float center =
-            static_cast<float>(
-                layer
-            ) -
+            static_cast<float>(layer) -
             static_cast<float>(
                 thickness - 1
             ) * 0.5f;
@@ -409,17 +381,36 @@ static void drawBlockOutline(
             center * spacing;
 
         /*
-         * XY bottom.
+         * Bottom.
          */
         drawFace(
             screenContext,
             tessellator,
             material,
             {
-                Vec3{minX, minY + o, minZ + o},
-                Vec3{maxX, minY + o, minZ + o},
-                Vec3{maxX, minY + o, maxZ},
-                Vec3{minX, minY + o, maxZ}
+                Vec3{
+                    minX,
+                    minY + o,
+                    minZ + o
+                },
+
+                Vec3{
+                    maxX,
+                    minY + o,
+                    minZ + o
+                },
+
+                Vec3{
+                    maxX,
+                    minY + o,
+                    maxZ
+                },
+
+                Vec3{
+                    minX,
+                    minY + o,
+                    maxZ
+                }
             },
             color,
             camX,
@@ -428,17 +419,36 @@ static void drawBlockOutline(
         );
 
         /*
-         * XY top.
+         * Top.
          */
         drawFace(
             screenContext,
             tessellator,
             material,
             {
-                Vec3{minX, maxY + o, minZ + o},
-                Vec3{maxX, maxY + o, minZ + o},
-                Vec3{maxX, maxY + o, maxZ},
-                Vec3{minX, maxY + o, maxZ}
+                Vec3{
+                    minX,
+                    maxY + o,
+                    minZ + o
+                },
+
+                Vec3{
+                    maxX,
+                    maxY + o,
+                    minZ + o
+                },
+
+                Vec3{
+                    maxX,
+                    maxY + o,
+                    maxZ
+                },
+
+                Vec3{
+                    minX,
+                    maxY + o,
+                    maxZ
+                }
             },
             color,
             camX,
@@ -447,17 +457,36 @@ static void drawBlockOutline(
         );
 
         /*
-         * XZ front.
+         * Front.
          */
         drawFace(
             screenContext,
             tessellator,
             material,
             {
-                Vec3{minX, minY + o, minZ},
-                Vec3{maxX, minY + o, minZ},
-                Vec3{maxX, maxY + o, minZ},
-                Vec3{minX, maxY + o, minZ}
+                Vec3{
+                    minX,
+                    minY + o,
+                    minZ
+                },
+
+                Vec3{
+                    maxX,
+                    minY + o,
+                    minZ
+                },
+
+                Vec3{
+                    maxX,
+                    maxY + o,
+                    minZ
+                },
+
+                Vec3{
+                    minX,
+                    maxY + o,
+                    minZ
+                }
             },
             color,
             camX,
@@ -466,17 +495,36 @@ static void drawBlockOutline(
         );
 
         /*
-         * XZ back.
+         * Back.
          */
         drawFace(
             screenContext,
             tessellator,
             material,
             {
-                Vec3{minX, minY + o, maxZ},
-                Vec3{maxX, minY + o, maxZ},
-                Vec3{maxX, maxY + o, maxZ},
-                Vec3{minX, maxY + o, maxZ}
+                Vec3{
+                    minX,
+                    minY + o,
+                    maxZ
+                },
+
+                Vec3{
+                    maxX,
+                    minY + o,
+                    maxZ
+                },
+
+                Vec3{
+                    maxX,
+                    maxY + o,
+                    maxZ
+                },
+
+                Vec3{
+                    minX,
+                    maxY + o,
+                    maxZ
+                }
             },
             color,
             camX,
@@ -485,17 +533,36 @@ static void drawBlockOutline(
         );
 
         /*
-         * YZ left.
+         * Left.
          */
         drawFace(
             screenContext,
             tessellator,
             material,
             {
-                Vec3{minX + o, minY, minZ},
-                Vec3{minX + o, minY, maxZ},
-                Vec3{minX + o, maxY, maxZ},
-                Vec3{minX + o, maxY, minZ}
+                Vec3{
+                    minX + o,
+                    minY,
+                    minZ
+                },
+
+                Vec3{
+                    minX + o,
+                    minY,
+                    maxZ
+                },
+
+                Vec3{
+                    minX + o,
+                    maxY,
+                    maxZ
+                },
+
+                Vec3{
+                    minX + o,
+                    maxY,
+                    minZ
+                }
             },
             color,
             camX,
@@ -504,17 +571,36 @@ static void drawBlockOutline(
         );
 
         /*
-         * YZ right.
+         * Right.
          */
         drawFace(
             screenContext,
             tessellator,
             material,
             {
-                Vec3{maxX + o, minY, minZ},
-                Vec3{maxX + o, minY, maxZ},
-                Vec3{maxX + o, maxY, maxZ},
-                Vec3{maxX + o, maxY, minZ}
+                Vec3{
+                    maxX + o,
+                    minY,
+                    minZ
+                },
+
+                Vec3{
+                    maxX + o,
+                    minY,
+                    maxZ
+                },
+
+                Vec3{
+                    maxX + o,
+                    maxY,
+                    maxZ
+                },
+
+                Vec3{
+                    maxX + o,
+                    maxY,
+                    minZ
+                }
             },
             color,
             camX,
@@ -525,19 +611,6 @@ static void drawBlockOutline(
 }
 
 
-/*
- * Main replacement for ThickBaddie's first outline target.
- *
- * Verified ABI:
- *
- * x0 = LevelRenderer-like object
- * x1 = ScreenContext
- * x4 = BlockPos*
- *
- * The original function is intentionally NOT called while
- * the module is enabled. ThickBaddie uses the same strategy:
- * its replacement completely owns the outline rendering path.
- */
 static void blockOutlineHook(
     void* levelRenderer,
     void* screenContext,
@@ -547,11 +620,10 @@ static void blockOutlineHook(
     std::uintptr_t x5,
     std::uintptr_t x6
 ) {
-    (void)x2;
-    (void)x3;
-    (void)x5;
-    (void)x6;
-
+    /*
+     * Module disabled:
+     * completely preserve vanilla behaviour.
+     */
     if (!g_module ||
         !g_module->enabled) {
 
@@ -571,16 +643,18 @@ static void blockOutlineHook(
     }
 
     /*
-     * Safety checks.
+     * Basic pointer validation.
      */
     if (!levelRenderer ||
         reinterpret_cast<std::uintptr_t>(
             levelRenderer
         ) < 0x1000 ||
+
         !screenContext ||
         reinterpret_cast<std::uintptr_t>(
             screenContext
         ) < 0x1000 ||
+
         !blockPosPtr ||
         reinterpret_cast<std::uintptr_t>(
             blockPosPtr
@@ -601,6 +675,9 @@ static void blockOutlineHook(
         return;
     }
 
+    /*
+     * Required functions must exist.
+     */
     if (!g_tessBegin ||
         !g_tessColor ||
         !g_tessVertex ||
@@ -621,6 +698,9 @@ static void blockOutlineHook(
         return;
     }
 
+    /*
+     * ThickBaddie passes the BlockPos through x4.
+     */
     const BlockPos block =
         *reinterpret_cast<const BlockPos*>(
             blockPosPtr
@@ -676,7 +756,8 @@ static void blockOutlineHook(
         *reinterpret_cast<std::uintptr_t*>(
             renderer +
             bedrocktools::sdk::offsets::
-                LevelRenderer::mLevelRendererPlayer
+                LevelRenderer::
+                    mLevelRendererPlayer
         );
 
     if (!lrpPtr ||
@@ -704,7 +785,8 @@ static void blockOutlineHook(
         reinterpret_cast<const float*>(
             lrpPtr +
             bedrocktools::sdk::offsets::
-                LevelRendererPlayer::mCamPos
+                LevelRendererPlayer::
+                    mCamPos
         );
 
     const float camX = cam[0];
@@ -712,9 +794,7 @@ static void blockOutlineHook(
     const float camZ = cam[2];
 
     /*
-     * Selection overlay material is an embedded material
-     * object at 0x1030, not a pointer that needs to be
-     * dereferenced.
+     * Selection overlay material.
      */
     void* material =
         reinterpret_cast<void*>(
@@ -725,6 +805,7 @@ static void blockOutlineHook(
         );
 
     if (!material) {
+
         if (g_blockOutlineOriginal) {
             g_blockOutlineOriginal(
                 levelRenderer,
@@ -741,49 +822,14 @@ static void blockOutlineHook(
     }
 
     /*
-     * Bedrock's selection rendering uses the color holder.
-     *
-     * Save it and restore it after our rendering.
+     * Generate RGB/chroma color.
      */
-    const auto colorHolderPtr =
-        *reinterpret_cast<std::uintptr_t*>(
-            screen +
-            bedrocktools::sdk::offsets::
-                ScreenContext::mColorHolder
-        );
-
-    float savedColor[4]{};
-
-    bool restoreColor = false;
-
-    if (colorHolderPtr &&
-        colorHolderPtr >= 0x1000) {
-
-        float* colorHolder =
-            reinterpret_cast<float*>(
-                colorHolderPtr
-            );
-
-        savedColor[0] = colorHolder[0];
-        savedColor[1] = colorHolder[1];
-        savedColor[2] = colorHolder[2];
-        savedColor[3] = colorHolder[3];
-
-        /*
-         * Keep the material neutral. RGB is supplied
-         * directly through TessellatorColor.
-         */
-        colorHolder[0] = 1.0f;
-        colorHolder[1] = 1.0f;
-        colorHolder[2] = 1.0f;
-        colorHolder[3] = 1.0f;
-
-        restoreColor = true;
-    }
-
     const Color color =
         getOutlineColor();
 
+    /*
+     * Draw the complete 3D outline.
+     */
     drawBlockOutline(
         screenContext,
         tessellator,
@@ -795,38 +841,20 @@ static void blockOutlineHook(
         color,
         g_module->thickness
     );
-
-    if (restoreColor) {
-        float* colorHolder =
-            reinterpret_cast<float*>(
-                colorHolderPtr
-            );
-
-        colorHolder[0] =
-            savedColor[0];
-
-        colorHolder[1] =
-            savedColor[1];
-
-        colorHolder[2] =
-            savedColor[2];
-
-        colorHolder[3] =
-            savedColor[3];
-    }
 }
 
 } // namespace
 
 
 OutlineRGBModule*
-    OutlineRGBModule::instance = nullptr;
+    OutlineRGBModule::instance =
+        nullptr;
 
 
 OutlineRGBModule::OutlineRGBModule()
     : Module(
         "Outline RGB",
-        "RGB 3D block outline with adjustable visual thickness."
+        "RGB 3D block outline with adjustable thickness."
     ) {
     showInMenu = true;
 
@@ -848,6 +876,13 @@ void OutlineRGBModule::onInit() {
     if (g_initialized)
         return;
 
+    /*
+     * ThickBaddie target:
+     *
+     * FD 7B BA A9 ...
+     *
+     * resolved through SignatureId::BlockOutlineRender.
+     */
     const auto target =
         bedrocktools::memory::resolve(
             bedrocktools::memory::SignatureId::
@@ -862,30 +897,53 @@ void OutlineRGBModule::onInit() {
             target
         );
 
-    g_tessBegin =
-        reinterpret_cast<Tessellator_begin_t>(
-            bedrocktools::memory::resolve(
-                bedrocktools::memory::SignatureId::
-                    TessellatorBegin
-            )
+    /*
+     * TessellatorBegin.
+     */
+    const auto begin =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                TessellatorBegin
         );
+
+    /*
+     * TessellatorColor.
+     */
+    const auto color =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                TessellatorColor
+        );
+
+    /*
+     * TessellatorVertex.
+     */
+    const auto vertexFn =
+        bedrocktools::memory::resolve(
+            bedrocktools::memory::SignatureId::
+                TessellatorVertex
+        );
+
+    g_tessBegin =
+        reinterpret_cast<
+            Tessellator_begin_t
+        >(begin);
 
     g_tessColor =
-        reinterpret_cast<Tessellator_color_t>(
-            bedrocktools::memory::resolve(
-                bedrocktools::memory::SignatureId::
-                    TessellatorColor
-            )
-        );
+        reinterpret_cast<
+            Tessellator_color_t
+        >(color);
 
     g_tessVertex =
-        reinterpret_cast<Tessellator_vertex_t>(
-            bedrocktools::memory::resolve(
-                bedrocktools::memory::SignatureId::
-                    TessellatorVertex
-            )
-        );
+        reinterpret_cast<
+            Tessellator_vertex_t
+        >(vertexFn);
 
+    /*
+     * RenderMesh.
+     *
+     * Prefer the newer signature if available.
+     */
     auto renderMesh =
         bedrocktools::memory::resolve(
             bedrocktools::memory::SignatureId::
@@ -951,10 +1009,10 @@ void OutlineRGBModule::onEnable() {
 
 void OutlineRGBModule::onDisable() {
     /*
-     * Hook stays installed.
+     * Hook remains installed.
      *
-     * blockOutlineHook transparently calls the native
-     * function while disabled.
+     * The hook calls the original function when
+     * the module is disabled.
      */
 }
 
