@@ -43,6 +43,7 @@ enum class SignatureId : std::uint16_t {
     BiomeGetTemperature,
     GetDestroyProgress,
     RenderLevel,
+    BlockOutlineRender,
     TessellatorBegin,
     TessellatorColor,
     TessellatorVertex,
